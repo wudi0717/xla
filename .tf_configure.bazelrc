@@ -1,0 +1,16 @@
+build --action_env PYTHON_BIN_PATH="/workspace/openxla/pjrt_plugin/tf2.15/bin/python3"
+build --action_env PYTHON_LIB_PATH="/workspace/openxla/pjrt_plugin/tf2.15/lib/python3.10/site-packages"
+build --python_path="/workspace/openxla/pjrt_plugin/tf2.15/bin/python3"
+build --config=nonccl
+build:opt --copt=-Wno-sign-compare
+build:opt --host_copt=-Wno-sign-compare
+test --flaky_test_attempts=3
+test --test_size_filters=small,medium
+test --test_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu,-oss_serial
+test --build_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu
+build --test_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu,-oss_serial
+build --build_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu
+test:v1 --test_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu,-oss_serial
+test:v1 --build_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu
+test:v2 --test_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu,-oss_serial,-v1only
+test:v2 --build_tag_filters=-benchmark-test,-no_oss,-oss_excluded,-gpu,-v1only

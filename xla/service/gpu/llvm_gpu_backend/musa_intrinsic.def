@@ -1,0 +1,9 @@
+static const Rule rules[] = {
+    {"llvm.nvvm.read.ptx.sreg.ctaid.x", "llvm.musa.read.ptx.sreg.ctaid.x", 0},
+    {"llvm.nvvm.read.ptx.sreg.tid.x", "llvm.musa.read.ptx.sreg.tid.x", 0},
+    {"llvm.nvvm.read.ptx.sreg.ntid.x", "llvm.musa.read.ptx.sreg.ntid.x", 0},
+    {"llvm.nvvm.barrier0", "llvm.musa.barrier0", 1},
+    {"llvm.nvvm.barrier.cta.sync.aligned.all", "llvm.musa.barrier0", 1},
+    {"llvm.nvvm.shfl.sync.down.i32", "llvm.musa.shfl.down.sync.i32", 2},
+    {"llvm.nvvm.shfl.sync.down.f32", "llvm.musa.shfl.down.sync.i32", 3},
+};

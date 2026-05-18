@@ -1,0 +1,1 @@
+export PYTHON_BIN_PATH="/workspace/openxla/pjrt_plugin/tf2.15/bin/python3"
