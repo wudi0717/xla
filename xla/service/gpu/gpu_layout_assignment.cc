@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/service/gpu/gpu_layout_assignment.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <cstddef>
 #include <initializer_list>
 #include <memory>
@@ -268,6 +270,30 @@ bool DotCanSupportShapeWithLayout(const HloInstruction* dot,
       .ok();
 }
 
+bool IsTruthyEnv(const char* name) {
+  const char* env = std::getenv(name);
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+         std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+         std::strcmp(env, "FALSE") != 0;
+}
+
+bool ShouldAvoidInterleavedBatchGemmLayout() {
+  return IsTruthyEnv("MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT");
+}
+
+bool IsInterleavedBatchGemmLayout(const Shape& shape,
+                                  absl::Span<const int64_t> batch_dims,
+                                  absl::Span<const int64_t> row_dims,
+                                  absl::Span<const int64_t> col_dims) {
+  if (batch_dims.empty()) return false;
+  auto layout = MatrixLayout::For(shape, batch_dims, row_dims, col_dims);
+  if (!layout.ok()) return false;
+  const int64_t contiguous_batch_stride =
+      layout->num_rows * layout->num_cols;
+  return layout->batch_size > 1 && layout->batch_stride > 0 &&
+         layout->batch_stride < contiguous_batch_stride;
+}
+
 }  // namespace
 
 Status GpuLayoutAssignment::AddBackendConstraints(
@@ -460,9 +486,12 @@ Status GpuLayoutAssignment::SetDotOperandLayout(
 
   // First, try to use the existing layout, if present.
   if (shape.has_layout() &&
-      MatrixLayout::For(shape, batch_dims, row_dims, col_dims).ok())
+      MatrixLayout::For(shape, batch_dims, row_dims, col_dims).ok() &&
+      !(ShouldAvoidInterleavedBatchGemmLayout() &&
+        IsInterleavedBatchGemmLayout(shape, batch_dims, row_dims, col_dims))) {
     // Re-set the operand layout, so it becomes mandatory.
     return SetOperandLayout(shape, instruction, operand);
+  }
 
   // Next, try the default layout (for the sake of everybody's sanity).
   LayoutUtil::SetToDefaultLayout(&shape);

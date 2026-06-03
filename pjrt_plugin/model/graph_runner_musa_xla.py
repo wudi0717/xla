@@ -55,9 +55,31 @@ def _early_device_arg():
             return arg.split("=", 1)[1].lower()
     return "cpu"
 
+def _early_batch_size_arg():
+    value = _get_cli_arg_value(sys.argv[1:], "--batchsize")
+    if value is None:
+        for arg in sys.argv[1:]:
+            if arg.startswith("--batchsize="):
+                value = arg.split("=", 1)[1]
+                break
+    if value is None:
+        return 100
+    try:
+        return int(value)
+    except ValueError:
+        return 100
+
+def _early_large_batch_threshold():
+    value = os.environ.get("MUSA_XLA_LARGE_BATCH_THRESHOLD", "512")
+    try:
+        return int(value)
+    except ValueError:
+        return 512
+
 use_musa_xla = "--xla" in sys.argv and _early_device_arg() == "musa"
 
 if use_musa_xla:
+    early_batch_size = _early_batch_size_arg()
     # Stable MUSA XLA path: let TensorFlow's XLA bridge auto-cluster and route
     # the compiled clusters through the NextPluggableDevice/PJRT plugin.
     os.environ["TF_PLUGGABLE_DEVICE_LIBRARY_PATH"] = musa_plugin_path
@@ -66,9 +88,29 @@ if use_musa_xla:
     # This combination produced one large cluster_0 HLO module instead of 283
     # tiny on-demand modules. Force it for the normal --device musa --xla path
     # so stale shell exports from experiments cannot silently change behavior.
-    if os.environ.get("MUSA_XLA_RESPECT_NPD_ENV", "").lower() not in ("1", "true", "yes", "on"):
-        os.environ["MUSA_NPD_IS_PLUGGABLE_DEVICE"] = "1"
-        os.environ["MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE"] = "1"
+    os.environ.pop("MUSA_XLA_RESPECT_NPD_ENV", None)
+    os.environ.pop("MUSA_XLA_GLOBAL_JIT_LEVEL", None)
+    os.environ.pop("MUSA_NPD_COMPILATION_DEVICE", None)
+    os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_COMPILES", None)
+    os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_TRANSFERS", None)
+    os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_EXECUTES", None)
+    os.environ.pop("MUSA_PJRT_WAIT_TRANSFER_DONE", None)
+    os.environ.pop("MUSA_PJRT_WAIT_EXECUTE_DONE", None)
+    os.environ.pop("MUSA_PJRT_SERIALIZE_EXECUTE", None)
+    os.environ.pop("MUSA_PJRT_DROP_EXECUTE_DEVICE", None)
+    os.environ.pop("MUSA_PJRT_FORCE_HOST_BUFFER_COPY", None)
+    os.environ.pop("MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT", None)
+    os.environ["MUSA_NPD_IS_PLUGGABLE_DEVICE"] = "1"
+    os.environ["MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE"] = "1"
+    if early_batch_size >= _early_large_batch_threshold():
+        os.environ["MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT"] = "1"
+    else:
+        # The stable batch=100 path uses fully asynchronous PJRT submission.
+        # Keeping these unset falls back to serialized proxy gates and produces
+        # very large tail-latency spikes.
+        os.environ["MUSA_PJRT_FORCE_HOST_BUFFER_COPY"] = "0"
+        os.environ["MUSA_PJRT_MAX_INFLIGHT_TRANSFERS"] = "0"
+        os.environ["MUSA_PJRT_MAX_INFLIGHT_EXECUTES"] = "0"
     tf_xla_flags = os.environ.get("TF_XLA_FLAGS", "")
     required_xla_flags = [
         "--tf_xla_auto_jit=2",
@@ -573,6 +615,26 @@ def create_mock_data(placeholders, batch_size):
     return feed_dict
 
 
+def summarize_feed_data(feed_dict, warmup_runs, num_runs):
+    if not feed_dict:
+        return
+    total_bytes = sum(getattr(data, "nbytes", 0) for data in feed_dict.values())
+    total_runs = warmup_runs + num_runs
+    print("\n=== Feed 输入规模 ===")
+    print(f"  输入 Tensor 数: {len(feed_dict)}")
+    print(f"  每轮输入:       {total_bytes / (1024 ** 2):.2f} MiB")
+    print(f"  预热+正式下限: {(total_bytes * total_runs) / (1024 ** 3):.2f} GiB")
+    top_inputs = sorted(
+        ((name, getattr(data, "nbytes", 0), getattr(data, "shape", None))
+         for name, data in feed_dict.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:5]
+    print("  最大输入 Top5:")
+    for name, size, shape in top_inputs:
+        print(f"    {size / (1024 ** 2):8.2f} MiB  shape={shape}  {name}")
+
+
 # ==========================================
 # 4. 执行推理
 # ==========================================
@@ -591,7 +653,11 @@ def run_inference(graph_def, feed_dict, output_node_name, device="cpu", xla=Fals
         print(f"MUSA_NPD_COMPILATION_DEVICE: {os.environ.get('MUSA_NPD_COMPILATION_DEVICE', '')}")
         print(f"MUSA_NPD_IS_PLUGGABLE_DEVICE: {os.environ.get('MUSA_NPD_IS_PLUGGABLE_DEVICE', '')}")
         print(f"MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE: {os.environ.get('MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE', '')}")
-    print(f"预热次数: {warmup_runs}, 正式运行次数: {num_runs}")
+        print(f"MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT: {os.environ.get('MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT', '')}")
+        print(f"MUSA_PJRT_FORCE_HOST_BUFFER_COPY: {os.environ.get('MUSA_PJRT_FORCE_HOST_BUFFER_COPY', '')}")
+        print(f"MUSA_PJRT_MAX_INFLIGHT_TRANSFERS: {os.environ.get('MUSA_PJRT_MAX_INFLIGHT_TRANSFERS', '')}")
+        print(f"MUSA_PJRT_MAX_INFLIGHT_EXECUTES: {os.environ.get('MUSA_PJRT_MAX_INFLIGHT_EXECUTES', '')}")
+        print(f"预热次数: {warmup_runs}, 正式运行次数: {num_runs}")
 
     device_name = f"/device:{device.upper()}:0" if device.lower() != "cpu" else "/device:CPU:0"
 
@@ -778,6 +844,7 @@ def main():
     t1 = time.time()
     feed_dict = create_mock_data(placeholders, args.batchsize)
     print(f"[时间] Mock 数据创建耗时: {(time.time() - t1)*1000:.2f} ms")
+    summarize_feed_data(feed_dict, args.warmup_runs, args.num_runs)
 
     # 3. 跑推理
     run_inference(

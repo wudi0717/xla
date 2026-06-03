@@ -1,6 +1,3 @@
-# Copyright 2023 The OpenXLA Authors
-#
-
 
 # Ignore the bazel directories when this directory is used as a local repository.
 bazel-*
@@ -8,6 +5,9 @@ bazel-bin
 bazel-out
 bazel-testlogs
 
+pjrt_plugin/model/__pycache__
+pjrt_plugin/model/tf_musa_runner_xla/runner_out
+pjrt_plugin/model/tf_musa_runner_xla/frozen_out
 
 # Emacs autosaves
 *~
