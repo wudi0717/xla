@@ -1,13 +1,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
-
-extern "C" void
-__real__ZN6google8protobuf14DescriptorPool24InternalAddGeneratedFileEPKvi(
-    const void* encoded_file_descriptor, int size);
+#include <dlfcn.h>
 
 namespace {
+
+using AddDescriptorsFn = void (*)(const void*);
+using InternalAddGeneratedFileFn = void (*)(const void*, int);
+
+bool ShouldSkipDescriptorRegistration() {
+  const char* env = std::getenv("MUSA_PJRT_SKIP_PROTO_DESCRIPTOR_REGISTRATION");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+         std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+         std::strcmp(env, "FALSE") != 0;
+}
 
 void LogSkippedRegistration(const char* entrypoint) {
   static int log_count = 0;
@@ -19,6 +27,42 @@ void LogSkippedRegistration(const char* entrypoint) {
     std::fflush(stderr);
     ++log_count;
   }
+}
+
+void LogForwardedRegistration(const char* entrypoint) {
+  static int log_count = 0;
+  if (log_count < 8) {
+    std::fprintf(stderr,
+                 "[musa_pjrt] forward protobuf generated descriptor "
+                 "registration via %s\n",
+                 entrypoint);
+    std::fflush(stderr);
+    ++log_count;
+  }
+}
+
+template <typename Fn>
+Fn ResolveRuntimeSymbol(const char* symbol_name) {
+#ifdef RTLD_NEXT
+  void* symbol = dlsym(RTLD_NEXT, symbol_name);
+  if (symbol != nullptr) {
+    return reinterpret_cast<Fn>(symbol);
+  }
+#else
+  void* symbol = nullptr;
+#endif
+
+  symbol = dlsym(RTLD_DEFAULT, symbol_name);
+  if (symbol != nullptr) {
+    return reinterpret_cast<Fn>(symbol);
+  }
+
+  return nullptr;
+}
+
+AddDescriptorsFn ResolveAddDescriptors() {
+  return ResolveRuntimeSymbol<AddDescriptorsFn>(
+      "_ZN6google8protobuf8internal14AddDescriptorsEPKNS1_15DescriptorTableE");
 }
 
 bool ReadVarint(const unsigned char* data, size_t size, size_t* offset,
@@ -94,22 +138,25 @@ bool HasPrefix(const char* value, size_t value_size, const char* prefix) {
          std::memcmp(value, prefix, prefix_size) == 0;
 }
 
-bool ShouldSkipDescriptor(const void* descriptor, int descriptor_size) {
+void LogDescriptorForward(const void* descriptor, int descriptor_size) {
   const char* name = nullptr;
   size_t name_size = 0;
   if (!ReadFileDescriptorName(descriptor, descriptor_size, &name, &name_size)) {
-    return false;
+    return;
   }
 
   if (HasPrefix(name, name_size, "xla/")) {
     std::fprintf(stderr,
-                 "[musa_pjrt] skip generated proto descriptor already owned "
-                 "by TensorFlow: %.*s\n",
+                 "[musa_pjrt] forward generated proto descriptor to active "
+                 "protobuf pool: %.*s\n",
                  static_cast<int>(name_size), name);
     std::fflush(stderr);
-    return true;
   }
-  return false;
+}
+
+InternalAddGeneratedFileFn ResolveInternalAddGeneratedFile() {
+  return ResolveRuntimeSymbol<InternalAddGeneratedFileFn>(
+      "_ZN6google8protobuf14DescriptorPool24InternalAddGeneratedFileEPKvi");
 }
 
 }  // namespace
@@ -117,32 +164,74 @@ bool ShouldSkipDescriptor(const void* descriptor, int descriptor_size) {
 extern "C" void
 __wrap__ZN6google8protobuf8internal14AddDescriptorsEPKNS1_15DescriptorTableE(
     const void* descriptor_table) {
-  (void)descriptor_table;
-  LogSkippedRegistration("internal::AddDescriptors");
+  if (ShouldSkipDescriptorRegistration()) {
+    LogSkippedRegistration("internal::AddDescriptors");
+    return;
+  }
+  LogForwardedRegistration("internal::AddDescriptors");
+  AddDescriptorsFn real_fn = ResolveAddDescriptors();
+  if (real_fn == nullptr) {
+    std::fprintf(stderr,
+                 "[musa_pjrt] failed to resolve protobuf "
+                 "internal::AddDescriptors\n");
+    std::fflush(stderr);
+    return;
+  }
+  real_fn(descriptor_table);
 }
 
 extern "C" void
 __wrap__ZN6google8protobuf8internal20AddDescriptorsRunnerC1EPKNS1_15DescriptorTableE(
     void* self, const void* descriptor_table) {
   (void)self;
-  (void)descriptor_table;
-  LogSkippedRegistration("internal::AddDescriptorsRunner::C1");
+  if (ShouldSkipDescriptorRegistration()) {
+    LogSkippedRegistration("internal::AddDescriptorsRunner::C1");
+    return;
+  }
+  LogForwardedRegistration("internal::AddDescriptorsRunner::C1");
+  AddDescriptorsFn real_fn = ResolveAddDescriptors();
+  if (real_fn == nullptr) {
+    std::fprintf(stderr,
+                 "[musa_pjrt] failed to resolve protobuf "
+                 "internal::AddDescriptors from AddDescriptorsRunner::C1\n");
+    std::fflush(stderr);
+    return;
+  }
+  real_fn(descriptor_table);
 }
 
 extern "C" void
 __wrap__ZN6google8protobuf8internal20AddDescriptorsRunnerC2EPKNS1_15DescriptorTableE(
     void* self, const void* descriptor_table) {
   (void)self;
-  (void)descriptor_table;
-  LogSkippedRegistration("internal::AddDescriptorsRunner::C2");
+  if (ShouldSkipDescriptorRegistration()) {
+    LogSkippedRegistration("internal::AddDescriptorsRunner::C2");
+    return;
+  }
+  LogForwardedRegistration("internal::AddDescriptorsRunner::C2");
+  AddDescriptorsFn real_fn = ResolveAddDescriptors();
+  if (real_fn == nullptr) {
+    std::fprintf(stderr,
+                 "[musa_pjrt] failed to resolve protobuf "
+                 "internal::AddDescriptors from AddDescriptorsRunner::C2\n");
+    std::fflush(stderr);
+    return;
+  }
+  real_fn(descriptor_table);
 }
 
 extern "C" void
 __wrap__ZN6google8protobuf14DescriptorPool24InternalAddGeneratedFileEPKvi(
     const void* encoded_file_descriptor, int size) {
-  if (ShouldSkipDescriptor(encoded_file_descriptor, size)) {
+  if (ShouldSkipDescriptorRegistration()) {
+    LogSkippedRegistration("DescriptorPool::InternalAddGeneratedFile");
     return;
   }
-  __real__ZN6google8protobuf14DescriptorPool24InternalAddGeneratedFileEPKvi(
-      encoded_file_descriptor, size);
+  InternalAddGeneratedFileFn real_fn = ResolveInternalAddGeneratedFile();
+  if (real_fn == nullptr) {
+    LogSkippedRegistration("DescriptorPool::InternalAddGeneratedFile");
+    return;
+  }
+  LogDescriptorForward(encoded_file_descriptor, size);
+  real_fn(encoded_file_descriptor, size);
 }

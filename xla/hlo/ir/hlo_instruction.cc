@@ -19,6 +19,8 @@ limitations under the License.
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -4625,6 +4627,13 @@ HloInstruction::BackendConfigRep& HloInstruction::BackendConfigRep::operator=(
   return *this;
 }
 
+static bool UseDefaultDebugOptionsForPjrtPlugin() {
+  const char* env = std::getenv("MUSA_PJRT_USE_DEFAULT_DEBUG_OPTIONS");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+         std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+         std::strcmp(env, "FALSE") != 0;
+}
+
 void HloInstruction::BackendConfigRep::SetProto(
     const tsl::protobuf::Message& proto) {
   proto_.reset(proto.New());
@@ -4645,6 +4654,9 @@ bool HloInstruction::BackendConfigRep::operator==(
 
 /* static */ StatusOr<std::string> HloInstruction::BackendConfigToRawString(
     const tsl::protobuf::Message& proto) {
+  if (UseDefaultDebugOptionsForPjrtPlugin()) {
+    return "{}";
+  }
   std::string ret;
   // Pass ignore_accuracy_loss = true because estimated_cycles field can be
   // INT64_MAX. If ignore_accuracy_loss = false and estimated_cycles =

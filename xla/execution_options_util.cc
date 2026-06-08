@@ -13,13 +13,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 #include "xla/execution_options_util.h"
+
+#include <cstdlib>
+#include <cstring>
+
 #include "xla/debug_options_flags.h"
 
 namespace xla {
+namespace {
+
+bool UseDefaultDebugOptionsForPjrtPlugin() {
+  const char* env = std::getenv("MUSA_PJRT_USE_DEFAULT_DEBUG_OPTIONS");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+         std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+         std::strcmp(env, "FALSE") != 0;
+}
+
+}  // namespace
 
 ExecutionOptions CreateDefaultExecutionOptions() {
   ExecutionOptions execution_options;
-  *(execution_options.mutable_debug_options()) = GetDebugOptionsFromFlags();
+  *(execution_options.mutable_debug_options()) =
+      UseDefaultDebugOptionsForPjrtPlugin() ? DefaultDebugOptionsIgnoringFlags()
+                                           : GetDebugOptionsFromFlags();
   return execution_options;
 }
 

@@ -19,7 +19,10 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
 DEFAULT_MUSA_PLUGIN_PATH = (
-    REPO_ROOT / "bazel-bin" / "pjrt_plugin" / "libmusa_pjrt_plugin_zy.so"
+    REPO_ROOT / "bazel-bin" / "pjrt_plugin" / "libmusa_pjrt_plugin.so"
+)
+DEFAULT_MUSA_TF_ADAPTER_PATH = (
+    REPO_ROOT / "bazel-bin" / "pjrt_plugin" / "libmusa_tf215_npd_adapter.so"
 )
 DEFAULT_XLA_DUMP_DIR = SCRIPT_DIR / "xla_dump"
 
@@ -73,6 +76,13 @@ def default_musa_plugin_path() -> str:
     return os.environ.get("MUSA_PJRT_PLUGIN_PATH", str(DEFAULT_MUSA_PLUGIN_PATH))
 
 
+def default_musa_tf_adapter_path() -> str:
+    return os.environ.get(
+        "MUSA_TF_NPD_ADAPTER_PATH",
+        str(DEFAULT_MUSA_TF_ADAPTER_PATH),
+    )
+
+
 def configure_runtime_env_from_argv(argv):
     device = _get_cli_arg(argv, "--device", "/device:MUSA:0")
     kind = device_kind(device)
@@ -94,7 +104,11 @@ def configure_runtime_env_from_argv(argv):
 
     if enable_xla and kind == "MUSA":
         plugin_path = _get_cli_arg(argv, "--musa_plugin", default_musa_plugin_path())
-        os.environ["TF_PLUGGABLE_DEVICE_LIBRARY_PATH"] = plugin_path
+        tf_adapter_path = _get_cli_arg(
+            argv, "--musa_tf_adapter", default_musa_tf_adapter_path()
+        )
+        os.environ["TF_PLUGGABLE_DEVICE_LIBRARY_PATH"] = tf_adapter_path
+        os.environ["MUSA_PJRT_PLUGIN_PATH"] = plugin_path
         os.environ["PJRT_NAMES_AND_LIBRARY_PATHS"] = f"MUSA:{plugin_path}"
 
         # Clear experiment leftovers, then set the stable PJRT/NPD path.
@@ -750,17 +764,26 @@ def convert_spec_to_pb(spec_path: Path, convert_script: Path, seed: int, out_roo
 def load_runtime_plugins(args):
     kind = device_kind(args.device)
     if kind != "MUSA":
-        print("[INFO] MUSA plugin loading skipped.")
         return False
 
     if args.xla:
         plugin_path = Path(args.musa_plugin).resolve()
         if not plugin_path.exists():
             raise FileNotFoundError(f"MUSA PJRT plugin not found: {plugin_path}")
-        lib = ctypes.CDLL(str(plugin_path))
+        tf_adapter_path = Path(args.musa_tf_adapter).resolve()
+        if not tf_adapter_path.exists():
+            raise FileNotFoundError(
+                f"MUSA TensorFlow adapter not found: {tf_adapter_path}"
+            )
+        os.environ["MUSA_PJRT_PLUGIN_PATH"] = str(plugin_path)
+        os.environ["PJRT_NAMES_AND_LIBRARY_PATHS"] = f"MUSA:{plugin_path}"
+        lib = ctypes.CDLL(str(tf_adapter_path))
         if hasattr(lib, "ForceRegisterMusa"):
-            lib.ForceRegisterMusa()
-        print(f">>>> [MUSA/XLA] PJRT plugin loaded: {plugin_path}")
+            lib.ForceRegisterMusa.restype = ctypes.c_int
+            if lib.ForceRegisterMusa() != 1:
+                raise RuntimeError(
+                    "MUSA PJRT registration failed in TensorFlow adapter"
+                )
         return True
 
     try:
@@ -770,7 +793,6 @@ def load_runtime_plugins(args):
             "Failed to import tensorflow_musa. Install tensorflow_musa for "
             "non-XLA MUSA runs or use --xla with --musa_plugin."
         ) from exc
-    print(">>>> [MUSA] Plugin loaded by importing tensorflow_musa")
     devices = tf.config.list_physical_devices("MUSA")
     if not devices:
         raise RuntimeError(f"requested device {args.device}, but no MUSA devices are visible")
@@ -816,7 +838,12 @@ def parse_args():
     parser.add_argument(
         "--musa_plugin",
         default=default_musa_plugin_path(),
-        help="Path to libmusa_pjrt_plugin_zy.so for MUSA XLA runs.",
+        help="Path to the MUSA PJRT core plugin for MUSA XLA runs.",
+    )
+    parser.add_argument(
+        "--musa_tf_adapter",
+        default=default_musa_tf_adapter_path(),
+        help="Path to the TensorFlow NextPluggableDevice adapter.",
     )
     return parser.parse_args()
 
@@ -837,15 +864,6 @@ def main():
     convert_script = Path(args.convert_script).resolve()
     if not convert_script.exists():
         raise FileNotFoundError(f"convert script not found: {convert_script}")
-
-    print("[INFO] Runtime configuration")
-    print(f"  device={args.device}")
-    print(f"  xla={args.xla}")
-    print(f"  TF_XLA_FLAGS={os.environ.get('TF_XLA_FLAGS', '')}")
-    print(f"  XLA_FLAGS={os.environ.get('XLA_FLAGS', '')}")
-    if device_kind(args.device) == "MUSA":
-        print(f"  musa_plugin={args.musa_plugin}")
-        print(f"  PJRT_NAMES_AND_LIBRARY_PATHS={os.environ.get('PJRT_NAMES_AND_LIBRARY_PATHS', '')}")
 
     musa_loaded = load_runtime_plugins(args)
     specs = collect_specs(args.spec, args.spec_dir)
@@ -960,6 +978,9 @@ def main():
             "XLA_FLAGS": os.environ.get("XLA_FLAGS", ""),
             "TF_PLUGGABLE_DEVICE_LIBRARY_PATH": os.environ.get(
                 "TF_PLUGGABLE_DEVICE_LIBRARY_PATH", ""
+            ),
+            "MUSA_PJRT_PLUGIN_PATH": os.environ.get(
+                "MUSA_PJRT_PLUGIN_PATH", ""
             ),
             "PJRT_NAMES_AND_LIBRARY_PATHS": os.environ.get(
                 "PJRT_NAMES_AND_LIBRARY_PATHS", ""

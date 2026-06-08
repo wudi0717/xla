@@ -27,6 +27,24 @@ limitations under the License.
 #include "xla/xla_data.pb.h"
 
 namespace xla {
+namespace {
+
+const char* PrecisionNameNoReflection(int precision) {
+  switch (precision) {
+    case PrecisionConfig::DEFAULT:
+      return "DEFAULT";
+    case PrecisionConfig::HIGH:
+      return "HIGH";
+    case PrecisionConfig::HIGHEST:
+      return "HIGHEST";
+    case PrecisionConfig::PACKED_NIBBLE:
+      return "PACKED_NIBBLE";
+    default:
+      return "DEFAULT";
+  }
+}
+
+}  // namespace
 
 mlir::ArrayAttr ConvertPrecisionConfig(const PrecisionConfig* config,
                                        mlir::Builder* builder) {
@@ -39,7 +57,7 @@ mlir::ArrayAttr ConvertPrecisionConfig(const PrecisionConfig* config,
   for (auto prec : config->operand_precision()) {
     operand_precision_attrs.push_back(mlir::mhlo::PrecisionAttr::get(
         builder->getContext(),
-        mlir::mhlo::symbolizePrecision(PrecisionConfig_Precision_Name(prec))
+        mlir::mhlo::symbolizePrecision(PrecisionNameNoReflection(prec))
             .value()));
   }
   return builder->getArrayAttr(operand_precision_attrs);

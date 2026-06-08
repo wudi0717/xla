@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "xla/client/executable_build_options.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <utility>
@@ -29,6 +31,16 @@ limitations under the License.
 #include "tsl/platform/statusor.h"
 
 namespace xla {
+namespace {
+
+bool UseDefaultDebugOptionsForPjrtPlugin() {
+  const char* env = std::getenv("MUSA_PJRT_USE_DEFAULT_DEBUG_OPTIONS");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+         std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+         std::strcmp(env, "FALSE") != 0;
+}
+
+}  // namespace
 
 ExecutableBuildOptions& ExecutableBuildOptions::set_device_allocator(
     se::DeviceMemoryAllocator* allocator) {
@@ -51,7 +63,11 @@ int ExecutableBuildOptions::device_ordinal() const { return device_ordinal_; }
 
 DebugOptions* ExecutableBuildOptions::mutable_debug_options() {
   if (!has_debug_options()) {
-    debug_options_ = GetDebugOptionsFromFlags();
+    if (UseDefaultDebugOptionsForPjrtPlugin()) {
+      debug_options_ = DefaultDebugOptionsIgnoringFlags();
+    } else {
+      debug_options_ = GetDebugOptionsFromFlags();
+    }
   }
   return &debug_options_.value();
 }

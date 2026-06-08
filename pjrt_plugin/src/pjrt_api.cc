@@ -5,9 +5,6 @@
 #include "xla/service/hlo.pb.h"
 #include "xla/pjrt/gpu/se_gpu_pjrt_client.h"
 #include "xla/stream_executor/platform_manager.h"
-#include "tensorflow/core/common_runtime/next_pluggable_device/c/plugin_c_api.h"
-#include "tensorflow/c/tf_status.h"
-#include "tensorflow/c/c_api.h"
 
 #include <iostream>
 #include <memory>
@@ -24,99 +21,9 @@
 #include <set>
 #include <sstream>
 #include <string>
-#include <dlfcn.h>
 
 extern "C" {
 
-// =========================================================================
-// 🏛️ TF 2.15 官方真实 C API 布局还原 (对齐 tpu/c_api_decl.h)
-// =========================================================================
-#define TPU_C_API_MAX_INLINED 6
-
-struct TF215_IntList { union { int* heap; int inlined[TPU_C_API_MAX_INLINED]; }; int64_t size; };
-struct TF215_Int64List { union { int64_t* heap; int64_t inlined[TPU_C_API_MAX_INLINED]; }; int64_t size; };
-struct TF215_BoolList { union { bool* heap; bool inlined[TPU_C_API_MAX_INLINED]; }; int64_t size; };
-struct TF215_Tile { TF215_Int64List dimensions; };
-struct TF215_TileList { union { TF215_Tile* heap; TF215_Tile inlined[TPU_C_API_MAX_INLINED]; }; int64_t size; };
-
-struct TF215_Layout {
-    TF215_Int64List minor_to_major;
-    TF215_IntList dim_level_types;
-    TF215_IntList dim_unique;
-    TF215_IntList dim_ordered;
-    TF215_TileList tiles;
-    int index_primitive_type;
-    int pointer_primitive_type;
-    int64_t element_size_in_bits;
-    int64_t memory_space;
-    int64_t dynamic_shape_metadata_prefix_bytes;
-};
-
-struct TF215_Shape {
-    int element_type;
-    TF215_Int64List dimensions;
-    TF215_BoolList dynamic_dimensions;
-    struct TF215_Shape* tuple_shapes; // owned
-    int ntuple_shapes;
-    bool has_layout;
-    TF215_Layout layout;
-};
-
-// 深拷贝拦截器实现
-static void DeepCopyIntList(TF215_IntList* dst, const TF215_IntList* src) {
-    dst->size = src->size;
-    if (src->size > TPU_C_API_MAX_INLINED) {
-        dst->heap = new int[src->size]; memcpy(dst->heap, src->heap, src->size * sizeof(int));
-    } else { memcpy(dst->inlined, src->inlined, src->size * sizeof(int)); }
-}
-static void DeepCopyInt64List(TF215_Int64List* dst, const TF215_Int64List* src) {
-    dst->size = src->size;
-    if (src->size > TPU_C_API_MAX_INLINED) {
-        dst->heap = new int64_t[src->size]; memcpy(dst->heap, src->heap, src->size * sizeof(int64_t));
-    } else { memcpy(dst->inlined, src->inlined, src->size * sizeof(int64_t)); }
-}
-static void DeepCopyBoolList(TF215_BoolList* dst, const TF215_BoolList* src) {
-    dst->size = src->size;
-    if (src->size > TPU_C_API_MAX_INLINED) {
-        dst->heap = new bool[src->size]; memcpy(dst->heap, src->heap, src->size * sizeof(bool));
-    } else { memcpy(dst->inlined, src->inlined, src->size * sizeof(bool)); }
-}
-static void DeepCopyTile(TF215_Tile* dst, const TF215_Tile* src) {
-    DeepCopyInt64List(&dst->dimensions, &src->dimensions);
-}
-static void DeepCopyTileList(TF215_TileList* dst, const TF215_TileList* src) {
-    dst->size = src->size;
-    if (src->size > TPU_C_API_MAX_INLINED) {
-        dst->heap = new TF215_Tile[src->size];
-        for (int64_t i = 0; i < src->size; ++i) DeepCopyTile(&dst->heap[i], &src->heap[i]);
-    } else {
-        for (int64_t i = 0; i < src->size; ++i) DeepCopyTile(&dst->inlined[i], &src->inlined[i]);
-    }
-}
-static void DeepCopyLayout(TF215_Layout* dst, const TF215_Layout* src) {
-    DeepCopyInt64List(&dst->minor_to_major, &src->minor_to_major);
-    DeepCopyIntList(&dst->dim_level_types, &src->dim_level_types);
-    DeepCopyIntList(&dst->dim_unique, &src->dim_unique);
-    DeepCopyIntList(&dst->dim_ordered, &src->dim_ordered);
-    DeepCopyTileList(&dst->tiles, &src->tiles);
-    dst->index_primitive_type = src->index_primitive_type;
-    dst->pointer_primitive_type = src->pointer_primitive_type;
-    dst->element_size_in_bits = src->element_size_in_bits;
-    dst->memory_space = src->memory_space;
-    dst->dynamic_shape_metadata_prefix_bytes = src->dynamic_shape_metadata_prefix_bytes;
-}
-static void DeepCopyShape(TF215_Shape* dst, const TF215_Shape* src) {
-    dst->element_type = src->element_type;
-    DeepCopyInt64List(&dst->dimensions, &src->dimensions);
-    DeepCopyBoolList(&dst->dynamic_dimensions, &src->dynamic_dimensions);
-    dst->ntuple_shapes = src->ntuple_shapes;
-    if (src->ntuple_shapes > 0 && src->tuple_shapes != nullptr) {
-        dst->tuple_shapes = new TF215_Shape[src->ntuple_shapes];
-        for (int i = 0; i < src->ntuple_shapes; ++i) DeepCopyShape(&dst->tuple_shapes[i], &src->tuple_shapes[i]);
-    } else { dst->tuple_shapes = nullptr; }
-    dst->has_layout = src->has_layout;
-    if (src->has_layout) DeepCopyLayout(&dst->layout, &src->layout);
-}
 
 // =========================================================================
 // 🚀 核心垫片层与实现
@@ -124,9 +31,7 @@ static void DeepCopyShape(TF215_Shape* dst, const TF215_Shape* src) {
 
 static PJRT_Api base_api;
 static bool base_api_initialized = false;
-static std::mutex g_musa_runtime_mu;
 static std::mutex g_execute_submit_mu;
-static bool g_musa_runtime_registered = false;
 static std::atomic<unsigned long long> g_event_destroy_bypass_count{0};
 static std::atomic<unsigned long long> g_buffer_destroy_bypass_count{0};
 static std::atomic<unsigned long long> g_client_compile_log_count{0};
@@ -159,31 +64,6 @@ static int GetPositiveEnvInt(const char* env_name) {
         return std::numeric_limits<int>::max();
     }
     return static_cast<int>(value);
-}
-
-static int GetEnvIntOrDefault(const char* env_name, int default_value) {
-    const char* env = std::getenv(env_name);
-    if (env == nullptr || env[0] == '\0') return default_value;
-
-    char* end = nullptr;
-    long value = std::strtol(env, &end, 10);
-    if (end == env || (end != nullptr && *end != '\0')) {
-        fprintf(stderr, "[MUSA PJRT] ignoring invalid %s=%s\n", env_name, env);
-        return default_value;
-    }
-    if (value > std::numeric_limits<int>::max()) {
-        return std::numeric_limits<int>::max();
-    }
-    if (value < std::numeric_limits<int>::min()) {
-        return std::numeric_limits<int>::min();
-    }
-    return static_cast<int>(value);
-}
-
-static const char* GetEnvOrDefault(const char* env_name, const char* default_value) {
-    const char* env = std::getenv(env_name);
-    if (env == nullptr || env[0] == '\0') return default_value;
-    return env;
 }
 
 static int GetCompileMaxInflight() {
@@ -245,88 +125,6 @@ class ScopedInflightGate {
     bool active_;
 };
 
-using TF_CreateAndSetPjRtCApiClient_Fn =
-    void (*)(const char*, TF_Status*, void*, int);
-
-TF_CreateAndSetPjRtCApiClient_Fn ResolveTfCreateAndSetPjRtCApiClient() {
-    void* symbol = dlsym(RTLD_DEFAULT, "TF_CreateAndSetPjRtCApiClient");
-    if (symbol != nullptr) {
-        return reinterpret_cast<TF_CreateAndSetPjRtCApiClient_Fn>(symbol);
-    }
-
-#ifdef RTLD_NOLOAD
-    constexpr const char* kTensorFlowRuntimeLibs[] = {
-        "libtensorflow_framework.so.2",
-        "libtensorflow_cc.so.2",
-    };
-    for (const char* lib_name : kTensorFlowRuntimeLibs) {
-        void* runtime_handle =
-            dlopen(lib_name, RTLD_LAZY | RTLD_GLOBAL | RTLD_NOLOAD);
-        if (runtime_handle == nullptr) {
-            continue;
-        }
-        symbol = dlsym(runtime_handle, "TF_CreateAndSetPjRtCApiClient");
-        if (symbol != nullptr) {
-            return reinterpret_cast<TF_CreateAndSetPjRtCApiClient_Fn>(symbol);
-        }
-    }
-#endif
-
-    void* process_handle = dlopen(nullptr, RTLD_LAZY | RTLD_GLOBAL);
-    if (process_handle == nullptr) {
-        return nullptr;
-    }
-
-    symbol = dlsym(process_handle, "TF_CreateAndSetPjRtCApiClient");
-    return reinterpret_cast<TF_CreateAndSetPjRtCApiClient_Fn>(symbol);
-}
-
-bool EnsureMusaRuntimeRegistered(TF_Status* tf_status, bool verbose) {
-    std::lock_guard<std::mutex> lock(g_musa_runtime_mu);
-    if (g_musa_runtime_registered) {
-        if (tf_status) TF_SetStatus(tf_status, TF_OK, "");
-        return true;
-    }
-
-    auto platform_or = stream_executor::PlatformManager::PlatformWithName("MUSA");
-    if (!platform_or.ok()) {
-        const std::string msg = std::string("failed to initialize MUSA platform: ") +
-                                platform_or.status().ToString();
-        if (verbose) fprintf(stderr, "!!!! [MUSA] %s\n", msg.c_str());
-        if (tf_status) TF_SetStatus(tf_status, TF_INTERNAL, msg.c_str());
-        return false;
-    }
-
-    auto create_pjrt_client = ResolveTfCreateAndSetPjRtCApiClient();
-    if (!create_pjrt_client) {
-        const std::string msg =
-            "symbol TF_CreateAndSetPjRtCApiClient not found in current TensorFlow runtime";
-        if (verbose) fprintf(stderr, "!!!! [MUSA] %s\n", msg.c_str());
-        if (tf_status) TF_SetStatus(tf_status, TF_INTERNAL, msg.c_str());
-        return false;
-    }
-
-    TF_Status* create_status = TF_NewStatus();
-    const char* pjrt_device_type = GetEnvOrDefault("MUSA_NPD_DEVICE_TYPE", "MUSA");
-    create_pjrt_client(pjrt_device_type, create_status, nullptr, 0);
-    if (TF_GetCode(create_status) != TF_OK) {
-        const std::string msg = std::string("TF_CreateAndSetPjRtCApiClient failed: ") +
-                                TF_Message(create_status);
-        if (verbose) fprintf(stderr, "!!!! [MUSA] %s\n", msg.c_str());
-        if (tf_status) TF_SetStatus(tf_status, TF_GetCode(create_status), msg.c_str());
-        TF_DeleteStatus(create_status);
-        return false;
-    }
-    TF_DeleteStatus(create_status);
-
-    g_musa_runtime_registered = true;
-    if (tf_status) TF_SetStatus(tf_status, TF_OK, "");
-    if (verbose) {
-        printf("✅ [MUSA] Plugin internal device states initialized.\n");
-        fflush(stdout);
-    }
-    return true;
-}
 
 // 1. 修正 AddressableMemories 大小错误 (32 -> 40)
 PJRT_Error* Proxy_Device_AddressableMemories(PJRT_Device_AddressableMemories_Args* args) {
@@ -775,7 +573,34 @@ PJRT_Error* Proxy_Client_Compile(PJRT_Client_Compile_Args* args) {
         args->compile_options = patched_compile_options->c_str();
         args->compile_options_size = patched_compile_options->size();
     }
+    if (should_log) {
+        fprintf(stderr,
+                "[musa_pjrt] client compile call base: count=%llu client=%p program_format=%.*s code=%p code_size=%zu options=%p options_size=%zu\n",
+                log_count,
+                args ? static_cast<void*>(args->client) : nullptr,
+                (args && args->program && args->program->format)
+                    ? static_cast<int>(args->program->format_size)
+                    : 0,
+                (args && args->program && args->program->format)
+                    ? args->program->format
+                    : "",
+                (args && args->program) ? static_cast<void*>(args->program->code)
+                                        : nullptr,
+                (args && args->program) ? static_cast<size_t>(args->program->code_size)
+                                        : 0,
+                args ? static_cast<const void*>(args->compile_options) : nullptr,
+                args ? static_cast<size_t>(args->compile_options_size) : 0);
+        fflush(stderr);
+    }
     PJRT_Error* err = base_api.PJRT_Client_Compile(args);
+    if (should_log) {
+        fprintf(stderr,
+                "[musa_pjrt] client compile base returned: count=%llu err=%p executable=%p\n",
+                log_count,
+                static_cast<void*>(err),
+                args ? static_cast<void*>(args->executable) : nullptr);
+        fflush(stderr);
+    }
     if (err == nullptr) {
         DumpOptimizedProgramAfterCompile(args, should_log, log_count);
     }
@@ -1109,25 +934,6 @@ PJRT_Error* Proxy_LoadedExecutable_Execute(PJRT_LoadedExecutable_Execute_Args* a
     return err;
 }
 
-void Musa_XlaShapeToDeviceShapeRepresentation(
-    XLA_Shape* c_xla_shape, int data_type, bool use_fast_memory,
-    XLA_LayoutPreference layout_preference, XLA_Shape* c_device_shape, TF_Status* status) {
-    if (c_xla_shape && c_device_shape) {
-        auto* src = reinterpret_cast<const TF215_Shape*>(c_xla_shape);
-        auto* dst = reinterpret_cast<TF215_Shape*>(c_device_shape);
-        DeepCopyShape(dst, src);
-    }
-    if (status) TF_SetStatus(status, TF_OK, "");
-}
-
-int32_t Musa_GetDeviceCount(TF_Status* status) {
-    if (status) TF_SetStatus(status, TF_OK, "");
-    return 8;
-}
-
-void Musa_InitPluginInternalDeviceStates(TF_Status* status) {
-    EnsureMusaRuntimeRegistered(status, true);
-}
 
 static bool ReadBoolEnv(const char* name, bool* value) {
     const char* env = std::getenv(name);
@@ -1172,6 +978,24 @@ static void ApplyMusaAllocatorEnv(xla::GpuAllocatorConfig* allocator_config) {
     allocator_config->kind = xla::GpuAllocatorConfig::Kind::kBFC;
     allocator_config->preallocate = false;
 
+    const char* allocator_kind = std::getenv("MUSA_PJRT_ALLOCATOR");
+    if (allocator_kind != nullptr && allocator_kind[0] != '\0') {
+        std::string kind(allocator_kind);
+        for (char& ch : kind) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+        if (kind == "platform") {
+            allocator_config->kind = xla::GpuAllocatorConfig::Kind::kPlatform;
+        } else if (kind == "default") {
+            allocator_config->kind = xla::GpuAllocatorConfig::Kind::kDefault;
+        } else if (kind == "bfc") {
+            allocator_config->kind = xla::GpuAllocatorConfig::Kind::kBFC;
+        } else {
+            fprintf(stderr, "[MUSA PJRT] ignoring invalid MUSA_PJRT_ALLOCATOR=%s\n",
+                    allocator_kind);
+        }
+    }
+
     bool preallocate = false;
     if (ReadBoolEnv("MUSA_PJRT_PREALLOCATE", &preallocate)) {
         allocator_config->preallocate = preallocate;
@@ -1182,27 +1006,65 @@ static void ApplyMusaAllocatorEnv(xla::GpuAllocatorConfig* allocator_config) {
         allocator_config->memory_fraction = memory_fraction;
     }
 
-    fprintf(stderr,
-            "[MUSA PJRT] allocator preallocate=%s memory_fraction=%.3f",
-            allocator_config->preallocate ? "true" : "false",
-            allocator_config->memory_fraction);
-    fprintf(stderr, "\n");
-    fflush(stderr);
 }
 
+static std::optional<std::set<int>> GetMusaAllowedDevices() {
+    const char* env = std::getenv("MUSA_PJRT_ALLOWED_DEVICES");
+    std::set<int> devices;
+
+    if (env == nullptr || env[0] == '\0') {
+        devices.insert(0);
+        return devices;
+    }
+
+    std::string text(env);
+    std::string lowered(text);
+    for (char& ch : lowered) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    if (lowered == "all") {
+        return std::nullopt;
+    }
+
+    std::stringstream stream(text);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        if (token.empty()) continue;
+        char* end = nullptr;
+        long value = std::strtol(token.c_str(), &end, 10);
+        if (end == token.c_str() || (end != nullptr && *end != '\0') || value < 0 ||
+            value > std::numeric_limits<int>::max()) {
+            fprintf(stderr,
+                    "[MUSA PJRT] invalid MUSA_PJRT_ALLOWED_DEVICES=%s; "
+                    "falling back to ordinal 0\n",
+                    env);
+            fflush(stderr);
+            return std::set<int>{0};
+        }
+        devices.insert(static_cast<int>(value));
+    }
+
+    if (devices.empty()) devices.insert(0);
+    return devices;
+}
 PJRT_Error* Musa_Client_Create(PJRT_Client_Create_Args* args) {
+    if (std::getenv("MUSA_PJRT_USE_DEFAULT_DEBUG_OPTIONS") == nullptr) {
+        setenv("MUSA_PJRT_USE_DEFAULT_DEBUG_OPTIONS", "1", 0);
+    }
     xla::GpuAllocatorConfig allocator_config;
     ApplyMusaAllocatorEnv(&allocator_config);
+    auto allowed_devices = GetMusaAllowedDevices();
     auto client_or = xla::GetStreamExecutorGpuClient(
         /*asynchronous=*/true, allocator_config, /*node_id=*/0,
-        /*num_nodes=*/1, /*allowed_devices=*/std::nullopt,
+        /*num_nodes=*/1, /*allowed_devices=*/allowed_devices,
         /*platform_name=*/std::string("MUSA"));
     if (!client_or.ok()) {
-        fprintf(stderr, "🚨 MUSA Init Failed: %s\n", client_or.status().ToString().c_str());
-        abort();
+        fprintf(stderr, "[MUSA PJRT] MUSA init failed: %s\n",
+                client_or.status().ToString().c_str());
+        fflush(stderr);
+        return new PJRT_Error{client_or.status()};
     }
     args->client = pjrt::CreateWrapperClient(std::move(client_or.value()));
-    printf("✅ MUSA Client Created.\n"); fflush(stdout);
     return nullptr;
 }
 
@@ -1237,57 +1099,6 @@ __attribute__((visibility("default"))) const PJRT_Api* GetPjrtApi() {
     return truncated_api;
 }
 
-__attribute__((visibility("default"))) const TFNPD_Api* TFNPD_InitPlugin(TFNPD_PluginParams* params, TF_Status* tf_status) {
-    if (params == nullptr) {
-        if (tf_status) {
-            TF_SetStatus(tf_status, TF_INVALID_ARGUMENT,
-                         "TFNPD_InitPlugin received null params");
-        }
-        return nullptr;
-    }
-
-    const char* dev_type = GetEnvOrDefault("MUSA_NPD_DEVICE_TYPE", "MUSA");
-    const char* comp_dev = GetEnvOrDefault("MUSA_NPD_COMPILATION_DEVICE", "XLA_GPU_JIT");
-    int priority_val = GetEnvIntOrDefault("MUSA_NPD_PRIORITY", 1000);
-    bool is_pluggable = true;
-    ReadBoolEnv("MUSA_NPD_IS_PLUGGABLE_DEVICE", &is_pluggable);
-    bool use_pjrt = true;
-    ReadBoolEnv("MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE", &use_pjrt);
-
-    params->ext = nullptr;
-    params->device_type = dev_type;
-    params->compilation_device_name = comp_dev;
-    params->priority = priority_val;
-    params->is_pluggable_device = is_pluggable;
-    params->use_pjrt_on_demand_compile = use_pjrt;
-
-    fprintf(stderr,
-            "[MUSA PJRT] TFNPD_InitPlugin struct_size=%zu device_type=%s compilation_device=%s priority=%d is_pluggable_device=%s use_pjrt_on_demand_compile=%s\n",
-            static_cast<size_t>(params->struct_size),
-            dev_type,
-            comp_dev,
-            priority_val,
-            is_pluggable ? "true" : "false",
-            use_pjrt ? "true" : "false");
-    fflush(stderr);
-
-    static TFNPD_Api npd_api = {};
-    npd_api.struct_size = TFNPD_Api_STRUCT_SIZE;
-    npd_api.TFNPD_XlaShapeToDeviceShapeRepresentation = Musa_XlaShapeToDeviceShapeRepresentation;
-    npd_api.TFNPD_GetDeviceCount = Musa_GetDeviceCount;
-    npd_api.TFNPD_InitPluginInternalDeviceStates = Musa_InitPluginInternalDeviceStates;
-
-    if (tf_status) TF_SetStatus(tf_status, TF_OK, "");
-    return &npd_api;
-}
-
-__attribute__((visibility("default"))) void ForceRegisterMusa() {
-    TF_Status* status = TF_NewStatus();
-    if (EnsureMusaRuntimeRegistered(status, true) && TF_GetCode(status) == TF_OK) {
-        printf("✅ [PYTHON HOOK] MUSA PJRT Factory Registered!\n");
-    }
-    TF_DeleteStatus(status);
-    fflush(stdout);
-}
 
 } // extern "C"
+

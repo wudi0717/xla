@@ -19,7 +19,6 @@ limitations under the License.
 #include <string>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/strings/ascii.h"
 #include "xla/types.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -27,6 +26,70 @@ limitations under the License.
 
 namespace xla {
 namespace primitive_util {
+namespace {
+
+const char* PrimitiveTypeNameNoReflection(PrimitiveType type) {
+  switch (type) {
+    case PRIMITIVE_TYPE_INVALID:
+      return "primitive_type_invalid";
+    case PRED:
+      return "pred";
+    case S4:
+      return "s4";
+    case S8:
+      return "s8";
+    case S16:
+      return "s16";
+    case S32:
+      return "s32";
+    case S64:
+      return "s64";
+    case U4:
+      return "u4";
+    case U8:
+      return "u8";
+    case U16:
+      return "u16";
+    case U32:
+      return "u32";
+    case U64:
+      return "u64";
+    case F16:
+      return "f16";
+    case F32:
+      return "f32";
+    case BF16:
+      return "bf16";
+    case F64:
+      return "f64";
+    case F8E5M2:
+      return "f8e5m2";
+    case F8E4M3FN:
+      return "f8e4m3fn";
+    case F8E4M3B11FNUZ:
+      return "f8e4m3b11fnuz";
+    case F8E5M2FNUZ:
+      return "f8e5m2fnuz";
+    case F8E4M3FNUZ:
+      return "f8e4m3fnuz";
+    case C64:
+      return "c64";
+    case C128:
+      return "c128";
+    case TUPLE:
+      return "tuple";
+    case OPAQUE_TYPE:
+      return "opaque";
+    case TOKEN:
+      return "token";
+    case PrimitiveType_INT_MIN_SENTINEL_DO_NOT_USE_:
+    case PrimitiveType_INT_MAX_SENTINEL_DO_NOT_USE_:
+      return "";
+  }
+  return "";
+}
+
+}  // namespace
 
 int SignificandWidth(PrimitiveType type) {
   return PrimitiveTypeSwitch<int>(
@@ -116,9 +179,7 @@ xla::PrimitiveType SignedIntegralTypeForBitWidth(int64_t src_bitwidth) {
   }
 }
 
-// Class to memoize the computation of
-//   absl::AsciiStrToLower(PrimitiveType_Name(p))
-// for all PrimitiveType values "p"
+// Class to memoize the lowercase name for all PrimitiveType values "p".
 //
 // xla::OPAQUE_TYPE canonically maps to the string "opaque" -- the only reason
 // it's called OPAQUE_TYPE is to avoid clashing with a windows.h macro.
@@ -129,8 +190,8 @@ class PrimitiveTypeNameGenerator {
       if (i == static_cast<int>(OPAQUE_TYPE)) {
         lowercase_name_[i] = "opaque";
       } else if (PrimitiveType_IsValid(i)) {
-        lowercase_name_[i] = absl::AsciiStrToLower(
-            PrimitiveType_Name(static_cast<PrimitiveType>(i)));
+        lowercase_name_[i] =
+            PrimitiveTypeNameNoReflection(static_cast<PrimitiveType>(i));
       }
     }
   }

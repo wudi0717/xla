@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -157,6 +158,13 @@ limitations under the License.
 namespace xla {
 namespace gpu {
 namespace {
+
+bool UseDefaultDebugOptionsForPjrtPlugin() {
+  const char* env = std::getenv("MUSA_PJRT_USE_DEFAULT_DEBUG_OPTIONS");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+         std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+         std::strcmp(env, "FALSE") != 0;
+}
 
 // Some HLO operations are not implemented as Thunks, and only available when
 // XLA:GPU compiled for XLA runtime. However we still depend on emitting thunk
@@ -1761,15 +1769,26 @@ Status IrEmitterUnnested::EmitFusion(
 
   // Parse backend config.
   FusionBackendConfig backend_config;
-  if (auto backend_config_str = fusion_op.getBackendConfig()
-                                    .value_or(mlir::Attribute())
-                                    .dyn_cast_or_null<mlir::StringAttr>()) {
-    auto status = tsl::HumanReadableJsonToProto(backend_config_str.str(),
-                                                &backend_config);
-    if (!status.ok()) {
-      LOG(ERROR) << "Ignoring invalid backend config on "
+  if (UseDefaultDebugOptionsForPjrtPlugin()) {
+    auto backend_config_or = fusion->backend_config<FusionBackendConfig>();
+    if (backend_config_or.ok()) {
+      backend_config = std::move(backend_config_or.value());
+    } else {
+      LOG(ERROR) << "Ignoring invalid HLO backend config on "
                  << GetIrNameFromLoc(op->getLoc()) << ": "
-                 << backend_config_str.str();
+                 << backend_config_or.status();
+    }
+  } else {
+    if (auto backend_config_str = fusion_op.getBackendConfig()
+                                      .value_or(mlir::Attribute())
+                                      .dyn_cast_or_null<mlir::StringAttr>()) {
+      auto status = tsl::HumanReadableJsonToProto(backend_config_str.str(),
+                                                  &backend_config);
+      if (!status.ok()) {
+        LOG(ERROR) << "Ignoring invalid backend config on "
+                   << GetIrNameFromLoc(op->getLoc()) << ": "
+                   << backend_config_str.str();
+      }
     }
   }
 

@@ -15,7 +15,8 @@ from typing import Dict, List, Any, Optional
 # ==========================================
 model_path = "./graph_def.pb"
 output_node_name = "predicts"  # 输出节点名称
-musa_plugin_path = "/workspace/xla_ref/xla/bazel-bin/pjrt_plugin/libmusa_pjrt_plugin_zy.so"
+DEFAULT_MUSA_PLUGIN_PATH = "/workspace/xla_ref/xla/bazel-bin/pjrt_plugin/libmusa_pjrt_plugin.so"
+DEFAULT_MUSA_TF_ADAPTER_PATH = "/workspace/xla_ref/xla/bazel-bin/pjrt_plugin/libmusa_tf215_npd_adapter.so"
 DEFAULT_XLA_DUMP_DIR = "/workspace/xla_ref/xla/pjrt_plugin/model/graph_runner_musa_xla_dump"
 
 def _get_cli_arg_value(argv, flag, default=None):
@@ -32,6 +33,14 @@ def _append_unique_flag(current_value: str, new_flag: str) -> str:
     if new_flag not in tokens:
         tokens.append(new_flag)
     return " ".join(tokens).strip()
+
+
+def _musa_pjrt_plugin_path() -> str:
+    return os.environ.get("MUSA_PJRT_PLUGIN_PATH", DEFAULT_MUSA_PLUGIN_PATH)
+
+
+def _musa_tf_adapter_path() -> str:
+    return os.environ.get("MUSA_TF_NPD_ADAPTER_PATH", DEFAULT_MUSA_TF_ADAPTER_PATH)
 
 
 def _set_flag_with_prefix(current_value: str, flag_prefix: str, new_flag: str) -> str:
@@ -77,28 +86,35 @@ def _early_large_batch_threshold():
         return 512
 
 use_musa_xla = "--xla" in sys.argv and _early_device_arg() == "musa"
+musa_plugin_path = _musa_pjrt_plugin_path()
+musa_tf_adapter_path = _musa_tf_adapter_path()
 
 if use_musa_xla:
     early_batch_size = _early_batch_size_arg()
     # Stable MUSA XLA path: let TensorFlow's XLA bridge auto-cluster and route
     # the compiled clusters through the NextPluggableDevice/PJRT plugin.
-    os.environ["TF_PLUGGABLE_DEVICE_LIBRARY_PATH"] = musa_plugin_path
+    os.environ["TF_PLUGGABLE_DEVICE_LIBRARY_PATH"] = musa_tf_adapter_path
+    os.environ["MUSA_PJRT_PLUGIN_PATH"] = musa_plugin_path
     os.environ["PJRT_NAMES_AND_LIBRARY_PATHS"] = f"MUSA:{musa_plugin_path}"
     os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    keep_pjrt_env = os.environ.get("MUSA_XLA_KEEP_PJRT_ENV", "").lower() in (
+        "1", "true", "yes", "on"
+    )
     # This combination produced one large cluster_0 HLO module instead of 283
     # tiny on-demand modules. Force it for the normal --device musa --xla path
     # so stale shell exports from experiments cannot silently change behavior.
     os.environ.pop("MUSA_XLA_RESPECT_NPD_ENV", None)
     os.environ.pop("MUSA_XLA_GLOBAL_JIT_LEVEL", None)
     os.environ.pop("MUSA_NPD_COMPILATION_DEVICE", None)
-    os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_COMPILES", None)
-    os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_TRANSFERS", None)
-    os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_EXECUTES", None)
-    os.environ.pop("MUSA_PJRT_WAIT_TRANSFER_DONE", None)
-    os.environ.pop("MUSA_PJRT_WAIT_EXECUTE_DONE", None)
-    os.environ.pop("MUSA_PJRT_SERIALIZE_EXECUTE", None)
-    os.environ.pop("MUSA_PJRT_DROP_EXECUTE_DEVICE", None)
-    os.environ.pop("MUSA_PJRT_FORCE_HOST_BUFFER_COPY", None)
+    if not keep_pjrt_env:
+        os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_COMPILES", None)
+        os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_TRANSFERS", None)
+        os.environ.pop("MUSA_PJRT_MAX_INFLIGHT_EXECUTES", None)
+        os.environ.pop("MUSA_PJRT_WAIT_TRANSFER_DONE", None)
+        os.environ.pop("MUSA_PJRT_WAIT_EXECUTE_DONE", None)
+        os.environ.pop("MUSA_PJRT_SERIALIZE_EXECUTE", None)
+        os.environ.pop("MUSA_PJRT_DROP_EXECUTE_DEVICE", None)
+        os.environ.pop("MUSA_PJRT_FORCE_HOST_BUFFER_COPY", None)
     os.environ.pop("MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT", None)
     os.environ["MUSA_NPD_IS_PLUGGABLE_DEVICE"] = "1"
     os.environ["MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE"] = "1"
@@ -108,9 +124,9 @@ if use_musa_xla:
         # The stable batch=100 path uses fully asynchronous PJRT submission.
         # Keeping these unset falls back to serialized proxy gates and produces
         # very large tail-latency spikes.
-        os.environ["MUSA_PJRT_FORCE_HOST_BUFFER_COPY"] = "0"
-        os.environ["MUSA_PJRT_MAX_INFLIGHT_TRANSFERS"] = "0"
-        os.environ["MUSA_PJRT_MAX_INFLIGHT_EXECUTES"] = "0"
+        os.environ.setdefault("MUSA_PJRT_FORCE_HOST_BUFFER_COPY", "0")
+        os.environ.setdefault("MUSA_PJRT_MAX_INFLIGHT_TRANSFERS", "0")
+        os.environ.setdefault("MUSA_PJRT_MAX_INFLIGHT_EXECUTES", "0")
     tf_xla_flags = os.environ.get("TF_XLA_FLAGS", "")
     required_xla_flags = [
         "--tf_xla_auto_jit=2",
@@ -121,8 +137,10 @@ if use_musa_xla:
             tf_xla_flags = (tf_xla_flags + " " + flag).strip()
     os.environ["TF_XLA_FLAGS"] = tf_xla_flags
 elif _early_device_arg() == "musa":
-    if os.environ.get("TF_PLUGGABLE_DEVICE_LIBRARY_PATH") == musa_plugin_path:
+    if os.environ.get("TF_PLUGGABLE_DEVICE_LIBRARY_PATH") == musa_tf_adapter_path:
         os.environ.pop("TF_PLUGGABLE_DEVICE_LIBRARY_PATH", None)
+    if os.environ.get("MUSA_PJRT_PLUGIN_PATH") == musa_plugin_path:
+        os.environ.pop("MUSA_PJRT_PLUGIN_PATH", None)
     if os.environ.get("PJRT_NAMES_AND_LIBRARY_PATHS") == f"MUSA:{musa_plugin_path}":
         os.environ.pop("PJRT_NAMES_AND_LIBRARY_PATHS", None)
     tf_xla_flags = os.environ.get("TF_XLA_FLAGS", "")
@@ -173,25 +191,18 @@ tf.disable_eager_execution()
 # 1. 加载 MUSA 插件，配置config
 # ==========================================
 def load_musa_plugin():
-    print("\n====================================================")
-    print("[PYTHON] Force registering MUSA PJRT plugin...")
-    if os.path.exists(musa_plugin_path):
+    if os.path.exists(musa_tf_adapter_path):
         try:
-            lib = ctypes.CDLL(musa_plugin_path)
-            lib.ForceRegisterMusa()
-            print(f">>>> [MUSA] PJRT plugin hook executed successfully from: {musa_plugin_path}")
-            devices = tf2.config.list_physical_devices("MUSA")
-            if devices:
-                print(f">>>> [MUSA] Physical devices: {devices}")
-            else:
-                print(">>>> [MUSA] Hook executed, but TensorFlow did not list MUSA devices.")
+            lib = ctypes.CDLL(musa_tf_adapter_path)
+            lib.ForceRegisterMusa.restype = ctypes.c_int
+            if lib.ForceRegisterMusa() != 1:
+                raise RuntimeError("MUSA PJRT registration failed in TensorFlow adapter")
         except Exception as e:
             print(f"!!!! [MUSA] Failed to register PJRT plugin: {e}")
             sys.exit(1)
     else:
-        print(f"!!!! [MUSA] Plugin not found at {musa_plugin_path}")
+        print(f"!!!! [MUSA] TF adapter not found at {musa_tf_adapter_path}")
         sys.exit(1)
-    print("====================================================\n")
 
 
 def prepare_xla_dump_dir(dump_dir: Optional[str]):
@@ -644,31 +655,13 @@ def run_inference(graph_def, feed_dict, output_node_name, device="cpu", xla=Fals
     print(f"设备: {device.upper()}")
     if device.lower() in ("cuda", "musa"):
         print(f"XLA: {xla}")
-    if xla and device.lower() == "musa":
-        print(f"TF_XLA_FLAGS: {os.environ.get('TF_XLA_FLAGS', '')}")
-        print(f"TF_PLUGGABLE_DEVICE_LIBRARY_PATH: {os.environ.get('TF_PLUGGABLE_DEVICE_LIBRARY_PATH', '')}")
-        print(f"PJRT_NAMES_AND_LIBRARY_PATHS: {os.environ.get('PJRT_NAMES_AND_LIBRARY_PATHS', '')}")
-        print(f"XLA_FLAGS: {os.environ.get('XLA_FLAGS', '')}")
-        print(f"MUSA_XLA_GLOBAL_JIT_LEVEL: {os.environ.get('MUSA_XLA_GLOBAL_JIT_LEVEL', '')}")
-        print(f"MUSA_NPD_COMPILATION_DEVICE: {os.environ.get('MUSA_NPD_COMPILATION_DEVICE', '')}")
-        print(f"MUSA_NPD_IS_PLUGGABLE_DEVICE: {os.environ.get('MUSA_NPD_IS_PLUGGABLE_DEVICE', '')}")
-        print(f"MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE: {os.environ.get('MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE', '')}")
-        print(f"MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT: {os.environ.get('MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT', '')}")
-        print(f"MUSA_PJRT_FORCE_HOST_BUFFER_COPY: {os.environ.get('MUSA_PJRT_FORCE_HOST_BUFFER_COPY', '')}")
-        print(f"MUSA_PJRT_MAX_INFLIGHT_TRANSFERS: {os.environ.get('MUSA_PJRT_MAX_INFLIGHT_TRANSFERS', '')}")
-        print(f"MUSA_PJRT_MAX_INFLIGHT_EXECUTES: {os.environ.get('MUSA_PJRT_MAX_INFLIGHT_EXECUTES', '')}")
-        print(f"预热次数: {warmup_runs}, 正式运行次数: {num_runs}")
 
     device_name = f"/device:{device.upper()}:0" if device.lower() != "cpu" else "/device:CPU:0"
 
     with tf.Graph().as_default() as graph:
         # 测量图导入时间
         t_import_start = time.time()
-        if xla and device.lower() == "musa":
-            print(">>>> [MUSA/XLA] Import graph with TensorFlow auto_jit")
-            tf.import_graph_def(graph_def, name="")
-        else:
-            tf.import_graph_def(graph_def, name="")
+        tf.import_graph_def(graph_def, name="")
         t_import_end = time.time()
         print(f"[时间] 图导入耗时: {(t_import_end - t_import_start)*1000:.2f} ms")
 

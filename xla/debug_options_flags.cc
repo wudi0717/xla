@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -208,6 +209,13 @@ DebugOptions DefaultDebugOptionsIgnoringFlags() {
 static absl::once_flag flags_init;
 static DebugOptions* flag_values;
 static std::vector<tsl::Flag>* flag_objects;
+
+static bool UseDefaultDebugOptionsForPjrtPlugin() {
+  const char* env = std::getenv("MUSA_PJRT_USE_DEFAULT_DEBUG_OPTIONS");
+  return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
+         std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
+         std::strcmp(env, "FALSE") != 0;
+}
 
 // Maps pass -> initial fuel values (parsed when AllocateFlags was run).
 static absl::flat_hash_map<std::string, int64_t>* initial_fuel;
@@ -1363,6 +1371,12 @@ void ResetThreadLocalFuel() {
 }
 
 bool ConsumeFuel(absl::string_view pass, bool* just_ran_out) {
+  if (UseDefaultDebugOptionsForPjrtPlugin()) {
+    if (just_ran_out != nullptr) {
+      *just_ran_out = false;
+    }
+    return true;
+  }
   absl::call_once(flags_init, &AllocateFlags, nullptr);
   if (just_ran_out != nullptr) {
     *just_ran_out = false;
