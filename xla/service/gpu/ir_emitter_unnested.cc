@@ -3333,27 +3333,6 @@ StatusOr<bool> IrEmitterUnnested::TryEmitMusaMixedTupleWarpRowReductionFusion(
     elementwise_tuple_indices.push_back(
         absl::StrCat(elementwise.tuple_index));
   }
-  LOG(INFO) << "[MUSA_MIXED_TUPLE_WARP_ROW_REDUCTION_KERNEL] fusion="
-            << fusion->name() << " reducers=" << absl::StrJoin(reducers, ",")
-            << " reductions=" << match->reductions.size()
-            << " elementwise_outputs=" << match->elementwise_outputs.size()
-            << " reduction_tuple_indices="
-            << absl::StrJoin(reduction_tuple_indices, ",")
-            << " elementwise_tuple_indices="
-            << absl::StrJoin(elementwise_tuple_indices, ",")
-            << " rows=" << match->rows << " width=" << match->width
-            << " data_elements=" << data_elements
-            << " min_data_elements=" << min_data_elements
-            << " small_width_max=" << small_width_max
-            << " small_width_threads_per_block="
-            << small_width_threads_per_block
-            << " small_width_override=" << (small_width_override ? 1 : 0)
-            << " requested_threads_per_block="
-            << requested_threads_per_block
-            << " warps_per_block=" << warps_per_block
-            << " threads_per_block=" << threads_per_block
-            << " elements_per_thread=" << launch_config->elements_per_thread
-            << " launch=" << launch_dimensions.ToString();
   return true;
 }
 
