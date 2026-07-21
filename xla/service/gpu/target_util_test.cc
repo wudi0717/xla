@@ -69,6 +69,17 @@ TEST_F(TargetUtilTest, MTGPUGroupBarrier) {
   EXPECT_FALSE(llvm::verifyModule(module_, &llvm::errs()));
 }
 
+TEST(TargetUtilDeviceFunctionNameTest, MTGPULog1pUsesMusaLibdeviceSymbol) {
+  llvm::Triple target_triple("mtgpu-mt-musa");
+
+  EXPECT_EQ(ObtainDeviceFunctionName(TargetDeviceFunctionID::kLog1p, F32,
+                                     target_triple),
+            "__mt_log1p_f32");
+  EXPECT_EQ(ObtainDeviceFunctionName(TargetDeviceFunctionID::kLog1p, F64,
+                                     target_triple),
+            "__mt_log1p_f64");
+}
+
 }  // namespace
 }  // namespace gpu
 }  // namespace xla

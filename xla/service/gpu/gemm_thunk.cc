@@ -15,11 +15,14 @@ limitations under the License.
 
 #include "xla/service/gpu/gemm_thunk.h"
 
+#include <cstdint>
+#include <string>
 #include <utility>
 
 #include "xla/service/gpu/matmul_utils.h"
 #include "xla/service/gpu/thunk.h"
 #include "xla/status.h"
+#include "xla/status_macros.h"
 #include "xla/stream_executor/device_memory.h"
 #include "tsl/platform/logging.h"
 

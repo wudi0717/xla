@@ -55,7 +55,18 @@ Status CustomCallThunk::ExecuteOnStream(const ExecuteParams& params) {
     }
   }
 
-#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
+#if TENSORFLOW_USE_MUSA
+  void* gpu_stream = params.stream->platform_specific_handle().stream;
+  XlaCustomCallStatus custom_call_status;
+  call_target_(gpu_stream, buffers.data(), opaque_.data(), opaque_.size(),
+               &custom_call_status);
+  auto message = CustomCallStatusGetMessage(&custom_call_status);
+  if (message) {
+    return InternalError("CustomCall failed: %s", *message);
+  } else {
+    return OkStatus();
+  }
+#elif GOOGLE_CUDA || TENSORFLOW_USE_ROCM
   auto gpu_stream = se::gpu::AsGpuStreamValue(params.stream);
   XlaCustomCallStatus custom_call_status;
   call_target_(gpu_stream, buffers.data(), opaque_.data(), opaque_.size(),

@@ -17,14 +17,20 @@ limitations under the License.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/log/check.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_join.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/mlir_hlo/lhlo_gpu/IR/lhlo_gpu_ops.h"
@@ -519,6 +525,97 @@ se::blas::DataType GetScaleType(se::blas::DataType c_type,
 
 namespace {
 
+bool IsMusaGemmRuntimeDiagnosticsEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("MUSA_XLA_GEMM_RUNTIME_DIAGNOSTICS");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+int64_t MusaGemmRuntimeLogInterval() {
+  static const int64_t interval = [] {
+    const char* value = std::getenv("MUSA_XLA_GEMM_RUNTIME_LOG_INTERVAL");
+    if (value == nullptr || value[0] == '\0') {
+      return int64_t{2048};
+    }
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);  // NOLINT(runtime/int)
+    if (end == value || parsed <= 0) {
+      return int64_t{2048};
+    }
+    return static_cast<int64_t>(parsed);
+  }();
+  return interval;
+}
+
+std::string MatrixOrderName(MatrixLayout::Order order) {
+  return order == MatrixLayout::Order::kRowMajor ? "row" : "col";
+}
+
+std::string GemmRuntimeKey(const MatrixLayout& lhs_layout,
+                           const MatrixLayout& rhs_layout,
+                           const MatrixLayout& output_layout,
+                           double beta) {
+  return absl::StrCat(
+      primitive_util::LowercasePrimitiveTypeName(lhs_layout.dtype), ",",
+      primitive_util::LowercasePrimitiveTypeName(rhs_layout.dtype), "->",
+      primitive_util::LowercasePrimitiveTypeName(output_layout.dtype),
+      " batch=", output_layout.batch_size, " m=", output_layout.num_rows,
+      " n=", output_layout.num_cols, " k=", lhs_layout.num_cols,
+      " lhs_order=", MatrixOrderName(lhs_layout.order),
+      " rhs_order=", MatrixOrderName(rhs_layout.order),
+      " out_order=", MatrixOrderName(output_layout.order),
+      " beta=", beta == 0.0 ? "0" : "nonzero");
+}
+
+void MaybeLogGemmRuntimeDiagnostic(const MatrixLayout& lhs_layout,
+                                   const MatrixLayout& rhs_layout,
+                                   const MatrixLayout& output_layout,
+                                   double beta) {
+  if (!IsMusaGemmRuntimeDiagnosticsEnabled()) {
+    return;
+  }
+
+  const std::string key =
+      GemmRuntimeKey(lhs_layout, rhs_layout, output_layout, beta);
+  static absl::Mutex mu(absl::kConstInit);
+  static int64_t total_calls = 0;
+  static auto* shape_counts = new absl::flat_hash_map<std::string, int64_t>();
+  int64_t total_snapshot = 0;
+  std::vector<std::pair<std::string, int64_t>> sorted_counts;
+  {
+    absl::MutexLock lock(&mu);
+    ++total_calls;
+    ++(*shape_counts)[key];
+    total_snapshot = total_calls;
+    if (total_snapshot % MusaGemmRuntimeLogInterval() != 0) {
+      return;
+    }
+    sorted_counts.assign(shape_counts->begin(), shape_counts->end());
+  }
+
+  std::sort(sorted_counts.begin(), sorted_counts.end(),
+            [](const auto& a, const auto& b) {
+              if (a.second != b.second) {
+                return a.second > b.second;
+              }
+              return a.first < b.first;
+            });
+  if (sorted_counts.size() > 10) {
+    sorted_counts.resize(10);
+  }
+
+  std::vector<std::string> top_parts;
+  top_parts.reserve(sorted_counts.size());
+  for (const auto& [shape, count] : sorted_counts) {
+    top_parts.push_back(absl::StrCat(count, "x:", shape));
+  }
+  LOG(INFO) << "[MUSA_XLA_GEMM_RUNTIME_DIAGNOSTICS] total_calls="
+            << total_snapshot << " top_shapes={"
+            << absl::StrJoin(top_parts, " | ") << "}";
+}
+
 // This struct contains the metadata of a matrix, e.g., its base address and
 // dimensions.
 struct MatrixDescriptor {
@@ -668,6 +765,8 @@ Status RunGemm(const GemmConfig& config, se::DeviceMemoryBase lhs_buffer,
   int64_t m = output_layout.num_rows;
   int64_t n = output_layout.num_cols;
   int64_t k = lhs_layout.num_cols;
+  MaybeLogGemmRuntimeDiagnostic(lhs_layout, rhs_layout, output_layout,
+                                config.beta);
   MatrixDescriptor lhs = GetMatrixDesc(lhs_layout, lhs_buffer);
   MatrixDescriptor rhs = GetMatrixDesc(rhs_layout, rhs_buffer);
   MatrixDescriptor output = GetMatrixDesc(output_layout, output_buffer);

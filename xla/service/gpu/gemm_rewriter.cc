@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -101,6 +102,26 @@ bool SupportsEpilogueFusion(PrimitiveType type) {
 
 bool IsF8Type(const HloInstruction *instr) {
   return primitive_util::IsF8Type(instr->shape().element_type());
+}
+
+bool MusaFuseBroadcastBiasAsMatrixEnabled() {
+  const char *value = std::getenv("MUSA_XLA_FUSE_BROADCAST_BIAS_AS_MATRIX");
+  if (value == nullptr) {
+    return false;
+  }
+  absl::string_view flag(value);
+  return flag == "1" || flag == "true" || flag == "TRUE" || flag == "on" ||
+         flag == "ON";
+}
+
+bool MusaAvoidGemmBetaChainEnabled() {
+  const char *value = std::getenv("MUSA_XLA_AVOID_GEMM_BETA_CHAIN");
+  if (value == nullptr) {
+    return false;
+  }
+  absl::string_view flag(value);
+  return flag == "1" || flag == "true" || flag == "TRUE" || flag == "on" ||
+         flag == "ON";
 }
 
 // Returns a new shape with non-batch dimensions padded to multiples of 16, as
@@ -694,6 +715,104 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
 
       // Continue below transforming new_add.
       instr = new_add;
+    }
+
+    // When both operands are already GEMM custom-calls, AddAnyOrder below can
+    // bind existing_gemm to the side that already has beta != 0 and then give
+    // up before trying the other side. Prefer the beta==0 GEMM explicitly so
+    // add(gemm(a,b), gemm(c,d[,e])) can become gemm(a,b, gemm(c,d[,e])).
+    HloInstruction *lhs_gemm = nullptr;
+    HloInstruction *rhs_gemm = nullptr;
+    if (Match(instr,
+              m::Add(GemmOrCublasLtMatmul(&lhs_gemm).WithOneUser(),
+                     GemmOrCublasLtMatmul(&rhs_gemm).WithOneUser()))) {
+      auto try_fuse_gemm_add = [&](HloInstruction *gemm,
+                                   HloInstruction *bias) -> StatusOr<bool> {
+        if (MusaAvoidGemmBetaChainEnabled() &&
+            (IsLegacyCublasMatmul(*bias) || IsCublasLtMatmul(*bias))) {
+          return false;
+        }
+        TF_ASSIGN_OR_RETURN(GemmBackendConfig config,
+                            gemm->backend_config<GemmBackendConfig>());
+        if (config.beta() != 0 ||
+            gemm->shape().element_type() == S32 ||
+            !Shape::Equal().IgnoreElementType()(bias->shape(),
+                                                gemm->shape())) {
+          return false;
+        }
+
+        TF_ASSIGN_OR_RETURN(
+            bool types_are_supported,
+            IsLegacyCublasMatmul(*gemm)
+                ? TypesAreSupportedByLegacyCublas(*gemm, config, instr)
+                : TypesAreSupportedByCublasLt(*gemm, config, instr));
+        bool has_no_consumer =
+            instr->shape().element_type() == gemm->shape().element_type() ||
+            instr->user_count() == 0 ||
+            (instr->user_count() == 1 &&
+             instr->users()[0]->opcode() == HloOpcode::kTuple &&
+             instr->users()[0]->user_count() == 0);
+        if (!types_are_supported || !has_no_consumer) {
+          return false;
+        }
+
+        bool bias_can_be_overwritten =
+            bias->user_count() <= 1 && bias->opcode() != HloOpcode::kParameter;
+        bool want_to_fuse_bias = IsCublasLtMatmulF8(*gemm) ||
+                                 IsCublasLtMatmul(*gemm) ||
+                                 bias_can_be_overwritten;
+        bool supported_epilogue =
+            config.epilogue() == GemmBackendConfig::DEFAULT ||
+            config.epilogue() == GemmBackendConfig::BIAS;
+        if (!want_to_fuse_bias || gemm->user_count() != 1 ||
+            !supported_epilogue) {
+          return false;
+        }
+
+        TF_RETURN_IF_ERROR(FuseMatrixBiasAdd(instr, bias, gemm));
+        return true;
+      };
+
+      TF_ASSIGN_OR_RETURN(bool was_fused,
+                          try_fuse_gemm_add(lhs_gemm, rhs_gemm));
+      if (was_fused) {
+        return OkStatus();
+      }
+      TF_ASSIGN_OR_RETURN(was_fused, try_fuse_gemm_add(rhs_gemm, lhs_gemm));
+      if (was_fused) {
+        return OkStatus();
+      }
+    }
+
+    if (MusaFuseBroadcastBiasAsMatrixEnabled() &&
+        Match(instr,
+              m::AddAnyOrder(
+                  m::AnyOf<HloInstruction>(
+                      GemmOrCublasLtMatmul(&existing_gemm).WithOneUser(),
+                      m::Convert(
+                          GemmOrCublasLtMatmul(&existing_gemm).WithOneUser())
+                          .WithOneUser()),
+                  m::Broadcast(&bias, m::Op()).WithOneUser()))) {
+      TF_ASSIGN_OR_RETURN(GemmBackendConfig gemm_backend_config,
+                          existing_gemm->backend_config<GemmBackendConfig>());
+
+      TF_ASSIGN_OR_RETURN(
+          bool types_are_supported,
+          IsLegacyCublasMatmul(*existing_gemm)
+              ? TypesAreSupportedByLegacyCublas(*existing_gemm,
+                                                gemm_backend_config, instr)
+              : TypesAreSupportedByCublasLt(*existing_gemm,
+                                            gemm_backend_config, instr));
+      bool has_no_consumer =
+          instr->shape().element_type() == existing_gemm->shape().element_type() ||
+          instr->user_count() == 0 ||
+          (instr->user_count() == 1 &&
+           instr->users()[0]->opcode() == HloOpcode::kTuple &&
+           instr->users()[0]->user_count() == 0);
+
+      if (types_are_supported && has_no_consumer) {
+        return FuseMatrixBiasAdd(instr, bias, existing_gemm);
+      }
     }
 
     // Attempt to fuse matrix bias into gemm with optional convert

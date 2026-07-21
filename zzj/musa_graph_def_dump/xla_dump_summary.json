@@ -1,0 +1,139 @@
+{
+  "dump_dir": "/workspace/xla_ref/xla/zzj/musa_graph_def_dump",
+  "hlo_txt_files": 233,
+  "after_optimizations_files": 3,
+  "fusion_ops": 214,
+  "modules_with_fusion": 2,
+  "zero_fusion_modules": 1,
+  "small_modules_le_10_instr": 1,
+  "instruction_count": {
+    "total": 8794,
+    "min": 0,
+    "p50": 4397,
+    "p95": 4397,
+    "max": 4397
+  },
+  "parameter_count": {
+    "total": 1398,
+    "min": 0,
+    "p50": 699,
+    "p95": 699,
+    "max": 699
+  },
+  "top_opcodes": [
+    [
+      "broadcast",
+      1772
+    ],
+    [
+      "constant",
+      1510
+    ],
+    [
+      "parameter",
+      1398
+    ],
+    [
+      "add",
+      1052
+    ],
+    [
+      "multiply",
+      998
+    ],
+    [
+      "select",
+      298
+    ],
+    [
+      "bitcast",
+      224
+    ],
+    [
+      "fusion",
+      214
+    ],
+    [
+      "reduce",
+      182
+    ],
+    [
+      "get-tuple-element",
+      140
+    ],
+    [
+      "custom-call",
+      136
+    ],
+    [
+      "compare",
+      130
+    ],
+    [
+      "subtract",
+      120
+    ],
+    [
+      "or",
+      100
+    ],
+    [
+      "divide",
+      84
+    ],
+    [
+      "maximum",
+      78
+    ],
+    [
+      "clamp",
+      74
+    ],
+    [
+      "slice",
+      60
+    ],
+    [
+      "tuple",
+      54
+    ],
+    [
+      "sqrt",
+      52
+    ]
+  ],
+  "top_fusion_files": [
+    {
+      "file": "module_0000.cluster_0__XlaCompiledKernel_true__XlaHasReferenceVars_false__XlaNumConstantArgs_4__XlaNumResourceArgs_0_.4827.sm_0.0_gpu_after_optimizations.txt",
+      "fusion_count": 107
+    },
+    {
+      "file": "module_0001.cluster_0__XlaCompiledKernel_true__XlaHasReferenceVars_false__XlaNumConstantArgs_4__XlaNumResourceArgs_0_.4827.after_optimizations.txt",
+      "fusion_count": 107
+    },
+    {
+      "file": "module_0000.cluster_0__XlaCompiledKernel_true__XlaHasReferenceVars_false__XlaNumConstantArgs_4__XlaNumResourceArgs_0_.4827.sm_0.0_gpu_after_optimizations-buffer-assignment.txt",
+      "fusion_count": 0
+    }
+  ],
+  "largest_modules": [
+    {
+      "file": "module_0000.cluster_0__XlaCompiledKernel_true__XlaHasReferenceVars_false__XlaNumConstantArgs_4__XlaNumResourceArgs_0_.4827.sm_0.0_gpu_after_optimizations.txt",
+      "instruction_count": 4397,
+      "parameter_count": 699,
+      "fusion_count": 107
+    },
+    {
+      "file": "module_0001.cluster_0__XlaCompiledKernel_true__XlaHasReferenceVars_false__XlaNumConstantArgs_4__XlaNumResourceArgs_0_.4827.after_optimizations.txt",
+      "instruction_count": 4397,
+      "parameter_count": 699,
+      "fusion_count": 107
+    },
+    {
+      "file": "module_0000.cluster_0__XlaCompiledKernel_true__XlaHasReferenceVars_false__XlaNumConstantArgs_4__XlaNumResourceArgs_0_.4827.sm_0.0_gpu_after_optimizations-buffer-assignment.txt",
+      "instruction_count": 0,
+      "parameter_count": 0,
+      "fusion_count": 0
+    }
+  ]
+}

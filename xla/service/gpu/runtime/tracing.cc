@@ -58,8 +58,9 @@ void RegisterTracingTypeIdNames(runtime::TypeIDNameRegistry& registry) {
 //===----------------------------------------------------------------------===//
 
 bool IsMusaDebugRuntimeTraceEnabled() {
-  return GetDebugEnv("TF_MUSA_DEBUG_RUNTIME_TRACE") ||
-         GetDebugEnv("TF_MUSA_DEBUG_DEALLOC");
+  static const bool enabled = GetDebugEnv("TF_MUSA_DEBUG_RUNTIME_TRACE") ||
+                              GetDebugEnv("TF_MUSA_DEBUG_DEALLOC");
+  return enabled;
 }
 
 std::string DebugString(const void* ptr) { return absl::StrFormat("%p", ptr); }

@@ -54,6 +54,7 @@ struct Rule {
   const char* old_name;
   const char* new_name;
   int type;
+  bool direct_mt_pow_only = false;
 };
 
 #include "musa_intrinsic.def"
@@ -85,6 +86,11 @@ std::string QuoteForShell(const std::string& path) {
 std::string GetConfiguredDumpDir() {
   const char* dump_dir = std::getenv("MTGPU_DUMP_DIR");
   return dump_dir == nullptr ? "" : dump_dir;
+}
+
+bool DirectMtPowEnabled() {
+  const char* value = std::getenv("MUSA_XLA_DIRECT_MT_POW");
+  return value != nullptr && std::string(value) == "1";
 }
 
 std::string Basename(const std::string& path) {
@@ -265,7 +271,8 @@ void PreserveGlobalVars(llvm::Module& module) {
   }
 }
 
-void ConvertNvvmToMusaIntrinsics(llvm::Module& module) {
+void ConvertNvvmToMusaIntrinsics(llvm::Module& module,
+                                 bool enable_direct_mt_pow) {
   struct RewriteRecord {
     llvm::CallInst* call;
     const Rule* rule;
@@ -284,6 +291,9 @@ void ConvertNvvmToMusaIntrinsics(llvm::Module& module) {
           continue;
         }
         for (const Rule& rule : rules) {
+          if (rule.direct_mt_pow_only && !enable_direct_mt_pow) {
+            continue;
+          }
           if (callee->getName() == rule.old_name) {
             worklist.push_back({call, &rule});
             break;
@@ -477,6 +487,11 @@ absl::StatusOr<std::vector<uint8_t>> CompileLlvmIrToHsacoImpl(
 
 }  // namespace
 
+void ConvertNvvmToMusaIntrinsicsForTest(llvm::Module* module,
+                                        bool enable_direct_mt_pow) {
+  ConvertNvvmToMusaIntrinsics(*module, enable_direct_mt_pow);
+}
+
 StatusOr<std::vector<uint8_t>> CompileToHsaco(
     llvm::Module* module,
     stream_executor::GpuComputeCapability gpu_version,
@@ -488,7 +503,7 @@ StatusOr<std::vector<uint8_t>> CompileToHsaco(
     module->setTargetTriple("mtgpu-mt-musa");
   }
   PreserveGlobalVars(*module);
-  ConvertNvvmToMusaIntrinsics(*module);
+  ConvertNvvmToMusaIntrinsics(*module, DirectMtPowEnabled());
 
   std::string ir_text;
   llvm::raw_string_ostream ir_stream(ir_text);

@@ -22,6 +22,7 @@ limitations under the License.
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,6 +41,7 @@ limitations under the License.
 #include "xla/test.h"
 #include "xla/tests/literal_test_util.h"
 #include "tsl/lib/core/status_test_util.h"
+#include "tensorflow/core/platform/casts.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/status.h"
 #include "tsl/platform/status_matchers.h"
@@ -108,6 +110,36 @@ static constexpr char const* kProgram = R"(HloModule HostTransfer
 
       ROOT result = f32[2] get-tuple-element(recv-done), index=0
     })";
+
+TEST(StreamExecutorGpuClientTest, AllowedSingleDeviceKeepsPhysicalOrdinal) {
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto all_devices_client,
+      GetStreamExecutorGpuClient(true, /*allocator_config=*/{}, /*node_id=*/0));
+  if (all_devices_client->addressable_devices().size() < 2) {
+    GTEST_SKIP() << "Test requires at least two local GPU devices.";
+  }
+  all_devices_client.reset();
+
+  TF_ASSERT_OK_AND_ASSIGN(
+      auto client,
+      GetStreamExecutorGpuClient(
+          true, /*allocator_config=*/{}, /*node_id=*/0, /*num_nodes=*/1,
+          /*allowed_devices=*/std::set<int>{1}));
+
+  ASSERT_EQ(client->addressable_devices().size(), 1);
+  PjRtDevice* device = client->addressable_devices()[0];
+  EXPECT_EQ(device->id(), 0);
+  EXPECT_EQ(device->local_hardware_id(), 1);
+
+  auto* se_device = tensorflow::down_cast<PjRtStreamExecutorDevice*>(device);
+  ASSERT_NE(se_device->local_device_state(), nullptr);
+  EXPECT_EQ(se_device->local_device_state()->device_ordinal(), 1);
+  EXPECT_EQ(se_device->local_device_state()->executor()->device_ordinal(), 1);
+
+  TF_ASSERT_OK_AND_ASSIGN(PjRtDevice* looked_up,
+                          client->LookupAddressableDevice(1));
+  EXPECT_EQ(looked_up, device);
+}
 
 TEST(StreamExecutorGpuClientTest, SendRecvChunked) {
   TF_ASSERT_OK_AND_ASSIGN(

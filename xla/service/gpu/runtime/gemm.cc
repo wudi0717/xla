@@ -124,7 +124,6 @@ static absl::Status GemmImpl(const ServiceExecutableRunOptions* run_options,
 
   VLOG(3) << "Running GEMM";
   se::Stream* stream = run_options->stream();
-  Shape output_shape = ToShape(out);
 
   // Get the gemm config from the state.
   auto gemm_config_or = state.GetOrCreate([&] {
@@ -137,45 +136,57 @@ static absl::Status GemmImpl(const ServiceExecutableRunOptions* run_options,
     return ToAbsl(gemm_config);
   });
   if (!gemm_config_or.ok()) {
-    LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", gemm_config_or.status());
+    if (IsMusaDebugRuntimeTraceEnabled()) {
+      LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", gemm_config_or.status());
+    }
     return gemm_config_or.status();
   }
   GemmConfig* gemm_config = *gemm_config_or;
 
-  LogMusaRuntimeCustomCallBegin(
-      "xla.gpu.gemm",
-      absl::StrCat("stream=", DebugString(stream),
-                   " algorithm=", algorithm, " lhs=", DebugString(lhs),
-                   " rhs=", DebugString(rhs), " out=", DebugString(out),
-                   " lhs_batch=", DebugString(dot_dims.lhs_batch),
-                   " lhs_contract=", DebugString(dot_dims.lhs_contract),
-                   " rhs_batch=", DebugString(dot_dims.rhs_batch),
-                   " rhs_contract=", DebugString(dot_dims.rhs_contract)));
+  const bool trace_enabled = IsMusaDebugRuntimeTraceEnabled();
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallBegin(
+        "xla.gpu.gemm",
+        absl::StrCat("stream=", DebugString(stream),
+                     " algorithm=", algorithm, " lhs=", DebugString(lhs),
+                     " rhs=", DebugString(rhs), " out=", DebugString(out),
+                     " lhs_batch=", DebugString(dot_dims.lhs_batch),
+                     " lhs_contract=", DebugString(dot_dims.lhs_contract),
+                     " rhs_batch=", DebugString(dot_dims.rhs_batch),
+                     " rhs_contract=", DebugString(dot_dims.rhs_contract)));
+  }
 
   // Set the gemm algorithm by runtime autotuning. We do runtime autotuning
   // outside of state.GetOrCreate() because otherwise it would be a potential
   // deadlock.
   if (gemm_config->algorithm == stream_executor::blas::kRuntimeAutotuning) {
 #if GOOGLE_CUDA
+    Shape output_shape = ToShape(out);
     auto status = DoRuntimeAutotuning(stream, *gemm_config, lhs_data, rhs_data,
                                       output_data, output_shape, beta,
                                       debug_options, gpu_lock);
     if (!status.ok()) {
       absl::Status runtime_status = absl::InternalError(status.ToString());
-      LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", runtime_status);
+      if (trace_enabled) {
+        LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", runtime_status);
+      }
       return runtime_status;
     }
 #else
     absl::Status runtime_status = absl::InternalError(
         "Failed to run runtime autotuner because CUDA is not enabled");
-    LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", runtime_status);
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", runtime_status);
+    }
     return runtime_status;
 #endif
   }
 
   absl::Status status = RunGemm(*gemm_config, lhs_data, rhs_data, output_data,
                                 deterministic_ops, stream);
-  LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", status);
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallEnd("xla.gpu.gemm", status);
+  }
   return status;
 }
 

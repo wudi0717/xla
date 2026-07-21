@@ -24,8 +24,10 @@ namespace wrap {
   __macro(mublasGetStream)           \
   __macro(mublasSetAtomicsMode)      \
   __macro(mublasGemmEx)              \
+  __macro(mublasGemmBatchedEx)       \
   __macro(mublasGemmStridedBatchedEx)\
   __macro(mublasSgemm)               \
+  __macro(mublasSgemmBatched)        \
   __macro(mublasDgemm)               \
   __macro(mublasCgemm)               \
   __macro(mublasZgemm)               \

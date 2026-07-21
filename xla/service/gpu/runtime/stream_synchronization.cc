@@ -26,31 +26,47 @@ namespace gpu {
 
 static absl::Status AwaitImpl(ConcurrentRegionStatus* region_status,
                               int64_t from, absl::Span<const int64_t> to) {
+  const bool trace_enabled = IsMusaDebugRuntimeTraceEnabled();
   auto from_stream_or = region_status->GetStream(from);
   if (!from_stream_or.ok()) {
-    LogMusaRuntimeCustomCallEnd("xla.streams.await", from_stream_or.status());
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd("xla.streams.await",
+                                  from_stream_or.status());
+    }
     return from_stream_or.status();
   }
   se::Stream* from_stream = *from_stream_or;
-  std::string details = absl::StrCat(
-      "from=", from, "@", DebugString(from_stream), " to=");
-  absl::StrAppend(&details, DebugString(to));
+  std::string details;
+  if (trace_enabled) {
+    details = absl::StrCat("from=", from, "@", DebugString(from_stream),
+                           " to=");
+    absl::StrAppend(&details, DebugString(to));
+  }
   for (int64_t to_index : to) {
     auto to_stream_or = region_status->GetStream(to_index);
     if (!to_stream_or.ok()) {
-      LogMusaRuntimeCustomCallEnd("xla.streams.await", to_stream_or.status());
+      if (trace_enabled) {
+        LogMusaRuntimeCustomCallEnd("xla.streams.await",
+                                    to_stream_or.status());
+      }
       return to_stream_or.status();
     }
     se::Stream* to_stream = *to_stream_or;
-    absl::StrAppend(&details, " wait_on=", to_index, "@",
-                    DebugString(to_stream));
+    if (trace_enabled) {
+      absl::StrAppend(&details, " wait_on=", to_index, "@",
+                      DebugString(to_stream));
+    }
     from_stream->ThenWaitFor(to_stream);
   }
 
-  LogMusaRuntimeCustomCallBegin("xla.streams.await", details);
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallBegin("xla.streams.await", details);
+  }
 
   absl::Status status = absl::OkStatus();
-  LogMusaRuntimeCustomCallEnd("xla.streams.await", status);
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallEnd("xla.streams.await", status);
+  }
   return status;
 }
 

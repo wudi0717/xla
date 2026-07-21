@@ -128,7 +128,8 @@ void InternalHostCallback(void* data) {
 
 tsl::StatusOr<std::unique_ptr<Stream>> MusaStream::Create(
     StreamExecutor* executor, MUcontext context,
-    std::optional<std::variant<StreamPriority, int>> priority) {
+    std::optional<std::variant<StreamPriority, int>> priority,
+    UnregisterStream unregister_stream) {
   ScopedActivateContext activation(context);
   TF_RETURN_IF_ERROR(activation.status());
   MUstream stream = nullptr;
@@ -154,24 +155,36 @@ tsl::StatusOr<std::unique_ptr<Stream>> MusaStream::Create(
   }
 
   return std::unique_ptr<Stream>(
-      new MusaStream(executor, context, priority, stream, completed_event));
+      new MusaStream(executor, context, priority, stream, completed_event,
+                     std::move(unregister_stream)));
 }
 
 MusaStream::MusaStream(
     StreamExecutor* executor, MUcontext context,
     std::optional<std::variant<StreamPriority, int>> priority,
-    MUstream stream_handle, MUevent completed_event)
+    MUstream stream_handle, MUevent completed_event,
+    UnregisterStream unregister_stream)
     : StreamCommon(executor, priority),
       executor_(executor),
       context_(context),
       stream_handle_(stream_handle),
-      completed_event_(completed_event) {
+      completed_event_(completed_event),
+      unregister_stream_(std::move(unregister_stream)) {
   absl::MutexLock lock(&mu_);
   status_ = ::tsl::OkStatus();
 }
 
 MusaStream::~MusaStream() {
-  BlockHostUntilDone().IgnoreError();
+  tsl::Status block_status = BlockHostUntilDone();
+  if (!block_status.ok()) {
+    LOG(WARNING) << "Error blocking host until done in MUSA stream destructor: "
+                 << block_status;
+  }
+  MarkDestructorSynchronizationHandled();
+
+  if (unregister_stream_) {
+    std::move(unregister_stream_)(stream_handle_);
+  }
 
   ScopedActivateContext activation(context_);
   if (!activation.ok()) {
@@ -184,8 +197,6 @@ MusaStream::~MusaStream() {
 
   stream_handle_ = nullptr;
   completed_event_ = nullptr;
-  absl::MutexLock lock(&mu_);
-  status_ = tsl::errors::Internal("MUSA stream already destroyed");
 }
 
 tsl::Status MusaStream::RecordCompletedEvent() {

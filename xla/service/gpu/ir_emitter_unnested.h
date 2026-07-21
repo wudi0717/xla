@@ -147,7 +147,26 @@ class IrEmitterUnnested : public IrEmitter {
   Status EmitCholeskyThunk(mlir::Operation* op);
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
   Status EmitCustomCallThunk(mlir::Operation* op);
+  Status EmitMusaGemmBetaChainThunk(mlir::Operation* op);
+  Status EmitMusaGemmEpilogueThunk(mlir::Operation* op);
+  Status EmitMusaPointerArrayGemmThunk(mlir::Operation* op);
+  Status EmitMusaSmallKDotThunk(mlir::Operation* op);
   Status EmitFftThunk(mlir::Operation* op);
+  StatusOr<bool> TryEmitMusaHotTupleSoftmaxFusion(
+      mlir::lmhlo::FusionOp fusion_op,
+      const HloFusionInstruction* fusion);
+  StatusOr<bool> TryEmitMusaReductionChainFusion(
+      mlir::lmhlo::FusionOp fusion_op,
+      const HloFusionInstruction* fusion);
+  StatusOr<bool> TryEmitMusaMixedTupleWarpRowReductionFusion(
+      mlir::lmhlo::FusionOp fusion_op,
+      const HloFusionInstruction* fusion);
+  StatusOr<bool> TryEmitMusaTupleWarpRowReductionFusion(
+      mlir::lmhlo::FusionOp fusion_op,
+      const HloFusionInstruction* fusion);
+  StatusOr<bool> TryEmitMusaWarpRowReductionFusion(
+      mlir::lmhlo::FusionOp fusion_op,
+      const HloFusionInstruction* fusion);
   Status EmitFusion(
       mlir::Operation* op,
       const absl::flat_hash_map<const mlir::Operation*, const HloInstruction*>&

@@ -420,6 +420,20 @@ void MusaMatmulBiasReluCustomCall(void* stream_handle, void** buffers,
   SetNotImplementedFailure(kMusaMatmulBiasReluCustomCallTarget, status);
 }
 
+void MusaGemmEpilogueCustomCall(void* stream_handle, void** buffers,
+                                const char* opaque, std::size_t opaque_len,
+                                XlaCustomCallStatus* status) {
+  (void)stream_handle;
+  (void)buffers;
+  (void)opaque;
+  (void)opaque_len;
+  if (IsMusaDebugRuntimeTraceEnabled()) {
+    LogMusaRuntimeCustomCallBegin(kMusaGemmEpilogueCustomCallTarget,
+                                  "GEMM epilogue placeholder implementation");
+  }
+  SetNotImplementedFailure(kMusaGemmEpilogueCustomCallTarget, status);
+}
+
 }  // namespace
 
 XLA_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM(std::string(kMusaLayerNormCustomCallTarget),
@@ -429,6 +443,10 @@ XLA_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM(std::string(kMusaLayerNormCustomCallTar
 XLA_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM(
     std::string(kMusaMatmulBiasReluCustomCallTarget),
     MusaMatmulBiasReluCustomCall, kMusaPlatformName);
+
+XLA_REGISTER_CUSTOM_CALL_TARGET_WITH_SYM(
+    std::string(kMusaGemmEpilogueCustomCallTarget),
+    MusaGemmEpilogueCustomCall, kMusaPlatformName);
 
 }  // namespace gpu
 }  // namespace xla

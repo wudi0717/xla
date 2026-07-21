@@ -23,6 +23,7 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "absl/types/span.h"
 #include "mlir/IR/Operation.h"  // from @llvm-project
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/gpu_executable_run_options.h"
@@ -34,6 +35,7 @@ namespace xla {
 namespace gpu {
 
 class GpuExecutable;
+class GemmThunk;
 
 enum AsyncStreamKind {
   kAsyncStreamCollective = 0,  // Stream for asynchronous collective ops.
@@ -127,6 +129,12 @@ class Thunk {
   // related XLA runtime custom calls). nullptr at runtime. MLIR codegen will
   // cease the practice of lowering thunks to XLA runtime custom calls.
   mlir::Operation* op() { return op_; }
+
+  virtual const GemmThunk* AsGemmThunk() const { return nullptr; }
+  virtual GemmThunk* AsGemmThunk() { return nullptr; }
+  virtual absl::Span<const BufferAllocation::Slice> buffer_arguments() const {
+    return {};
+  }
 
   // Prepares the thunk for execution on the given StreamExecutor.
   //

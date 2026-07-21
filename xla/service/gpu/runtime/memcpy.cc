@@ -46,7 +46,9 @@ absl::Status MemcpyImpl(const ServiceExecutableRunOptions* run_options,
     DCHECK(region_status->IsInConcurrentRegion());
     auto stream_or = region_status->GetStream(stream_id);
     if (!stream_or.ok()) {
-      LogMusaRuntimeCustomCallEnd(target, stream_or.status());
+      if (IsMusaDebugRuntimeTraceEnabled()) {
+        LogMusaRuntimeCustomCallEnd(target, stream_or.status());
+      }
       return stream_or.status();
     }
     stream = *stream_or;
@@ -54,23 +56,30 @@ absl::Status MemcpyImpl(const ServiceExecutableRunOptions* run_options,
     stream = region_status->GetNextStream();
   }
 
-  LogMusaRuntimeCustomCallBegin(
-      target, absl::StrCat("stream_attr=", stream_id,
-                           " stream=", DebugString(stream),
-                           " dst=", DebugString(dst),
-                           " src=", DebugString(src)));
+  const bool trace_enabled = IsMusaDebugRuntimeTraceEnabled();
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallBegin(
+        target, absl::StrCat("stream_attr=", stream_id,
+                             " stream=", DebugString(stream),
+                             " dst=", DebugString(dst),
+                             " src=", DebugString(src)));
+  }
 
   if (dst.sizes != src.sizes) {
     absl::Status status = absl::InvalidArgumentError(
         "Source memref sizes do not match destination memref sizes");
-    LogMusaRuntimeCustomCallEnd(target, status);
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd(target, status);
+    }
     return status;
   }
 
   if (dst.strides != src.strides) {
     absl::Status status = absl::InvalidArgumentError(
         "Source memref strides do not match destination memref strides");
-    LogMusaRuntimeCustomCallEnd(target, status);
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd(target, status);
+    }
     return status;
   }
 
@@ -95,12 +104,16 @@ absl::Status MemcpyImpl(const ServiceExecutableRunOptions* run_options,
   // transfer is completed.
   if (direction != MemcpyDirection::kD2D) {
     absl::Status status = stream->BlockHostUntilDone();
-    LogMusaRuntimeCustomCallEnd(target, status);
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd(target, status);
+    }
     return status;
   }
 
   absl::Status status = absl::OkStatus();
-  LogMusaRuntimeCustomCallEnd(target, status);
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallEnd(target, status);
+  }
   return status;
 }
 

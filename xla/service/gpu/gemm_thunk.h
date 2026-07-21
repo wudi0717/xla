@@ -41,6 +41,14 @@ class GemmThunk : public Thunk {
   Status ExecuteOnStream(const ExecuteParams& params) override;
   Status Initialize(const GpuExecutable& executable,
                     se::StreamExecutor* executor) override;
+  const GemmThunk* AsGemmThunk() const override { return this; }
+  GemmThunk* AsGemmThunk() override { return this; }
+
+  const GemmConfig& config() const { return config_; }
+  const BufferAllocation::Slice& lhs_buffer() const { return lhs_buffer_; }
+  const BufferAllocation::Slice& rhs_buffer() const { return rhs_buffer_; }
+  const BufferAllocation::Slice& output_buffer() const { return output_buffer_; }
+  bool deterministic() const { return deterministic_; }
 
  private:
   const GemmConfig config_;

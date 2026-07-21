@@ -16,8 +16,11 @@ limitations under the License.
 #include "xla/service/gpu/gpu_executable.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -42,7 +45,10 @@ limitations under the License.
 #include "xla/service/buffer_assignment.h"
 #include "xla/service/gpu/buffer_allocations.h"
 #include "xla/service/gpu/gpu_constants.h"
+#include "xla/service/gpu/gemm_thunk.h"
 #include "xla/service/gpu/non_atomically_upgradeable_rw_lock.h"
+#include "xla/service/gpu/musa_grouped_gemm_thunk.h"
+#include "xla/service/gpu/musa_small_gemm_accum_thunk.h"
 #include "xla/service/gpu/runtime/executable.h"
 #include "xla/service/gpu/runtime2/executable.h"
 #include "xla/service/gpu/stream_executor_util.h"
@@ -56,6 +62,7 @@ limitations under the License.
 #include "xla/status.h"
 #include "xla/status_macros.h"
 #include "xla/statusor.h"
+#include "xla/stream_executor/command_buffer.h"
 #include "xla/stream_executor/cuda/cuda_platform_id.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/stream_executor/device_memory.h"
@@ -93,6 +100,17 @@ bool IsXlaGpu2RuntimeEnabled(const HloModuleConfig& config) {
   return config.debug_options().xla_gpu_enable_gpu2_runtime();
 }
 
+struct MusaClassicThunkGraphCache {
+  absl::Mutex mutex;
+  std::map<std::vector<uintptr_t>, std::unique_ptr<se::CommandBuffer>> entries
+      ABSL_GUARDED_BY(mutex);
+  std::set<std::vector<uintptr_t>> failed_keys ABSL_GUARDED_BY(mutex);
+  std::set<se::StreamExecutor*> warmed_executors ABSL_GUARDED_BY(mutex);
+  std::map<se::StreamExecutor*, std::vector<uintptr_t>> last_keys
+      ABSL_GUARDED_BY(mutex);
+  std::set<std::vector<uintptr_t>> logged_hit_keys ABSL_GUARDED_BY(mutex);
+};
+
 namespace {
 
 using ::tsl::profiler::ScopedAnnotation;
@@ -101,6 +119,43 @@ using ::tsl::profiler::ScopedAnnotationAlways;
 bool IsMusaDebugDeallocEnabled() {
   const char* value = std::getenv("TF_MUSA_DEBUG_DEALLOC");
   return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool IsTruthyEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool IsMusaThunkDiagnosticsEnabled() {
+  return IsTruthyEnv("MUSA_XLA_THUNK_DIAGNOSTICS");
+}
+
+bool IsMusaThunkTimingEnabled() {
+  const char* value = std::getenv("MUSA_XLA_THUNK_TIMING");
+  return value != nullptr && value[0] != '\0' && value[0] != '0' &&
+         std::strcmp(value, "false") != 0 && std::strcmp(value, "False") != 0 &&
+         std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
+
+bool IsMusaClassicThunkGraphEnabled() {
+  return IsTruthyEnv("MUSA_XLA_CLASSIC_THUNK_GRAPH");
+}
+
+bool IsMusaExecutionPathVerboseEnabled() {
+  return IsTruthyEnv("MUSA_XLA_EXECUTION_PATH_VERBOSE");
+}
+
+int64_t ReadInt64Env(const char* name, int64_t default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  int64_t parsed = std::strtoll(value, &end, 10);
+  if (end == value) {
+    return default_value;
+  }
+  return parsed;
 }
 
 std::string DescribeAllocationForDebug(const BufferAllocation& allocation,
@@ -157,6 +212,627 @@ bool NeedsAsyncCommsStream(Thunk& thunk) {
   }
 }
 
+std::string ShortMusaThunkAnnotation(const Thunk& thunk) {
+  std::string annotation = thunk.profile_annotation();
+  if (annotation.empty()) {
+    return std::string(Thunk::KindToString(thunk.kind()));
+  }
+  constexpr size_t kMaxAnnotationLength = 96;
+  if (annotation.size() <= kMaxAnnotationLength) {
+    return annotation;
+  }
+  annotation.resize(kMaxAnnotationLength);
+  annotation.append("...");
+  return annotation;
+}
+
+std::string CompactMusaThunkTimingAnnotation(const Thunk& thunk) {
+  std::string annotation = ShortMusaThunkAnnotation(thunk);
+  for (char& ch : annotation) {
+    if (std::isspace(static_cast<unsigned char>(ch))) {
+      ch = '_';
+    }
+  }
+  return annotation;
+}
+
+struct MusaThunkTimingItem {
+  int64_t index = 0;
+  std::string kind;
+  std::string annotation;
+  int64_t elapsed_us = 0;
+};
+
+struct MusaThunkKindTiming {
+  std::string kind;
+  int64_t count = 0;
+  int64_t elapsed_us = 0;
+};
+
+std::string FormatMusaThunkTimingKindTotals(
+    const absl::flat_hash_map<std::string, MusaThunkKindTiming>& totals) {
+  std::vector<MusaThunkKindTiming> rows;
+  rows.reserve(totals.size());
+  for (const auto& entry : totals) {
+    rows.push_back(entry.second);
+  }
+  std::sort(rows.begin(), rows.end(), [](const MusaThunkKindTiming& a,
+                                         const MusaThunkKindTiming& b) {
+    if (a.elapsed_us != b.elapsed_us) return a.elapsed_us > b.elapsed_us;
+    return a.kind < b.kind;
+  });
+
+  std::vector<std::string> parts;
+  for (int64_t i = 0; i < rows.size() && i < 16; ++i) {
+    parts.push_back(absl::StrCat(rows[i].kind, ":count=", rows[i].count,
+                                 ",us=", rows[i].elapsed_us));
+  }
+  return absl::StrJoin(parts, " | ");
+}
+
+std::string FormatMusaThunkTimingTopThunks(
+    std::vector<MusaThunkTimingItem> timings) {
+  std::sort(timings.begin(), timings.end(), [](const MusaThunkTimingItem& a,
+                                               const MusaThunkTimingItem& b) {
+    if (a.elapsed_us != b.elapsed_us) return a.elapsed_us > b.elapsed_us;
+    return a.index < b.index;
+  });
+
+  std::vector<std::string> parts;
+  for (int64_t i = 0; i < timings.size() && i < 20; ++i) {
+    const MusaThunkTimingItem& item = timings[i];
+    std::string part = absl::StrCat("#", item.index, ":", item.kind,
+                                    ":us=", item.elapsed_us);
+    if (!item.annotation.empty()) {
+      absl::StrAppend(&part, ":ann=", item.annotation);
+    }
+    parts.push_back(std::move(part));
+  }
+  return absl::StrJoin(parts, " | ");
+}
+
+Status ExecuteThunkWithOptionalTiming(
+    int64_t index, Thunk& thunk, const Thunk::ExecuteParams& thunk_params,
+    se::Stream* main_stream, std::vector<MusaThunkTimingItem>* timings,
+    absl::flat_hash_map<std::string, MusaThunkKindTiming>* kind_totals,
+    int64_t* total_us) {
+  TF_RETURN_IF_ERROR(main_stream->BlockHostUntilDone());
+  const int64_t start_us = tsl::Env::Default()->NowMicros();
+  Status status = thunk.ExecuteOnStream(thunk_params);
+  if (!status.ok()) {
+    LOG(INFO) << "[MUSA_THUNK_TIMING] failed index=" << index
+              << " kind=" << Thunk::KindToString(thunk.kind())
+              << " status=" << status;
+    return status;
+  }
+  TF_RETURN_IF_ERROR(main_stream->BlockHostUntilDone());
+  const int64_t elapsed_us = tsl::Env::Default()->NowMicros() - start_us;
+  const std::string kind(Thunk::KindToString(thunk.kind()));
+  timings->push_back(
+      {index, kind, CompactMusaThunkTimingAnnotation(thunk), elapsed_us});
+  MusaThunkKindTiming& aggregate = (*kind_totals)[kind];
+  aggregate.kind = kind;
+  aggregate.count += 1;
+  aggregate.elapsed_us += elapsed_us;
+  *total_us += elapsed_us;
+  return OkStatus();
+}
+
+struct MusaClassicThunkGraphExecution {
+  bool executed = false;
+};
+
+struct MusaClassicThunkGraphAddressChanges {
+  bool signature_changed = false;
+  int64_t changed_allocations = 0;
+  int64_t changed_params = 0;
+  int64_t changed_temp = 0;
+  int64_t changed_live_out = 0;
+  int64_t changed_constant = 0;
+  int64_t changed_other = 0;
+  int64_t changed_bytes = 0;
+};
+
+void LogMusaClassicThunkGraph(const std::string& module_name,
+                              ModuleIdentifier module_id, bool eligible,
+                              bool cache_hit, bool captured,
+                              absl::string_view fallback_reason,
+                              int64_t total_thunks, int64_t kernel_thunks,
+                              int64_t gemm_thunks, int64_t cache_entries,
+                              MusaClassicThunkGraphAddressChanges changes = {}) {
+}
+
+std::vector<uintptr_t> MusaClassicThunkGraphKey(
+    se::StreamExecutor* executor,
+    const BufferAllocations& buffer_allocations) {
+  std::vector<uintptr_t> key;
+  key.reserve(2 + buffer_allocations.size() * 2);
+  key.push_back(reinterpret_cast<uintptr_t>(executor));
+  key.push_back(static_cast<uintptr_t>(buffer_allocations.device_ordinal()));
+  for (BufferAllocation::Index i = 0; i < buffer_allocations.size(); ++i) {
+    se::DeviceMemoryBase buffer = buffer_allocations.GetDeviceAddress(i);
+    key.push_back(reinterpret_cast<uintptr_t>(buffer.opaque()));
+    key.push_back(static_cast<uintptr_t>(buffer.size()));
+  }
+  return key;
+}
+
+MusaClassicThunkGraphAddressChanges MusaClassicThunkGraphKeyChanges(
+    const std::vector<uintptr_t>& previous_key,
+    const std::vector<uintptr_t>& current_key,
+    const std::vector<BufferAllocation>& allocations) {
+  MusaClassicThunkGraphAddressChanges changes;
+  if (previous_key.empty() || previous_key.size() != current_key.size()) {
+    return changes;
+  }
+
+  changes.signature_changed = previous_key != current_key;
+  const size_t allocation_count = std::min(
+      allocations.size(), current_key.size() > 2
+                              ? (current_key.size() - 2) / 2
+                              : static_cast<size_t>(0));
+  for (size_t i = 0; i < allocation_count; ++i) {
+    const size_t key_index = 2 + i * 2;
+    if (previous_key[key_index] == current_key[key_index] &&
+        previous_key[key_index + 1] == current_key[key_index + 1]) {
+      continue;
+    }
+
+    ++changes.changed_allocations;
+    changes.changed_bytes += static_cast<int64_t>(current_key[key_index + 1]);
+    const BufferAllocation& allocation = allocations[i];
+    if (allocation.is_entry_computation_parameter()) {
+      ++changes.changed_params;
+    } else if (allocation.IsPreallocatedTempBuffer()) {
+      ++changes.changed_temp;
+    } else if (allocation.is_constant()) {
+      ++changes.changed_constant;
+    } else if (allocation.maybe_live_out()) {
+      ++changes.changed_live_out;
+    } else {
+      ++changes.changed_other;
+    }
+  }
+  return changes;
+}
+
+StatusOr<MusaClassicThunkGraphExecution> TryExecuteMusaClassicThunkGraph(
+    const std::string& module_name, ModuleIdentifier module_id,
+    const ThunkSequence& thunk_sequence,
+    const ServiceExecutableRunOptions* run_options,
+    const BufferAllocations& buffer_allocations,
+    const std::vector<BufferAllocation>& allocations,
+    MusaClassicThunkGraphCache* cache) {
+  se::Stream* main_stream = run_options->stream();
+  se::StreamExecutor* executor = main_stream->parent();
+  int64_t kernel_thunks = 0;
+  int64_t gemm_thunks = 0;
+  for (const std::unique_ptr<Thunk>& thunk : thunk_sequence) {
+    if (thunk->kind() == Thunk::kKernel) {
+      ++kernel_thunks;
+    } else if (thunk->kind() == Thunk::kGemm) {
+      ++gemm_thunks;
+    } else {
+      LogMusaClassicThunkGraph(
+          module_name, module_id, /*eligible=*/false, /*cache_hit=*/false,
+          /*captured=*/false,
+          absl::StrCat("unsupported_thunk:",
+                       Thunk::KindToString(thunk->kind())),
+          thunk_sequence.size(), kernel_thunks, gemm_thunks, 0);
+      return MusaClassicThunkGraphExecution{};
+    }
+  }
+  if (thunk_sequence.empty()) {
+    LogMusaClassicThunkGraph(module_name, module_id, /*eligible=*/false,
+                             /*cache_hit=*/false, /*captured=*/false,
+                             "empty_sequence", 0, 0, 0, 0);
+    return MusaClassicThunkGraphExecution{};
+  }
+
+  const int64_t max_cache_entries = std::max<int64_t>(
+      1, ReadInt64Env("MUSA_XLA_CLASSIC_THUNK_GRAPH_MAX_CACHE_ENTRIES", 4));
+  std::vector<uintptr_t> key =
+      MusaClassicThunkGraphKey(executor, buffer_allocations);
+
+  absl::MutexLock lock(&cache->mutex);
+  MusaClassicThunkGraphAddressChanges changes;
+  auto previous_key = cache->last_keys.find(executor);
+  if (previous_key != cache->last_keys.end()) {
+    changes = MusaClassicThunkGraphKeyChanges(previous_key->second, key,
+                                              allocations);
+  }
+  cache->last_keys[executor] = key;
+
+  auto existing = cache->entries.find(key);
+  if (existing != cache->entries.end()) {
+    TF_RETURN_IF_ERROR(executor->Submit(main_stream, *existing->second));
+    if (cache->logged_hit_keys.insert(key).second) {
+      LogMusaClassicThunkGraph(
+          module_name, module_id, /*eligible=*/true, /*cache_hit=*/true,
+          /*captured=*/false, "", thunk_sequence.size(), kernel_thunks,
+          gemm_thunks, cache->entries.size(), changes);
+    }
+    return MusaClassicThunkGraphExecution{/*executed=*/true};
+  }
+  if (cache->failed_keys.find(key) != cache->failed_keys.end()) {
+    LogMusaClassicThunkGraph(
+        module_name, module_id, /*eligible=*/true, /*cache_hit=*/false,
+        /*captured=*/false, "capture_previously_failed",
+        thunk_sequence.size(), kernel_thunks, gemm_thunks,
+        cache->entries.size(), changes);
+    return MusaClassicThunkGraphExecution{};
+  }
+  if (static_cast<int64_t>(cache->entries.size()) >= max_cache_entries) {
+    LogMusaClassicThunkGraph(module_name, module_id, /*eligible=*/true,
+                             /*cache_hit=*/false, /*captured=*/false,
+                             "cache_full", thunk_sequence.size(),
+                             kernel_thunks, gemm_thunks,
+                             cache->entries.size(), changes);
+    return MusaClassicThunkGraphExecution{};
+  }
+  if (cache->warmed_executors.insert(executor).second) {
+    LogMusaClassicThunkGraph(module_name, module_id, /*eligible=*/true,
+                             /*cache_hit=*/false, /*captured=*/false,
+                             "warmup", thunk_sequence.size(), kernel_thunks,
+                             gemm_thunks, cache->entries.size(), changes);
+    return MusaClassicThunkGraphExecution{};
+  }
+
+  // Initialize BLAS support before capture so lazy setup is not recorded in
+  // the graph trace.
+  if (gemm_thunks > 0 && executor->AsBlas() == nullptr) {
+    cache->failed_keys.insert(key);
+    LogMusaClassicThunkGraph(module_name, module_id, /*eligible=*/true,
+                             /*cache_hit=*/false, /*captured=*/false,
+                             "blas_unavailable", thunk_sequence.size(),
+                             kernel_thunks, gemm_thunks,
+                             cache->entries.size(), changes);
+    return MusaClassicThunkGraphExecution{};
+  }
+
+  StatusOr<se::CommandBuffer> traced = se::CommandBuffer::Trace(
+      executor, [&](se::Stream* trace_stream) -> Status {
+        absl::InlinedVector<se::Stream*, kAsyncStreamTotal>
+            no_async_comms_streams(kAsyncStreamTotal, nullptr);
+        for (const std::unique_ptr<Thunk>& thunk : thunk_sequence) {
+          Thunk::ExecuteParams thunk_params{*run_options, buffer_allocations,
+                                            trace_stream,
+                                            no_async_comms_streams};
+          TF_RETURN_IF_ERROR(thunk->ExecuteOnStream(thunk_params));
+        }
+        return OkStatus();
+      });
+  if (!traced.ok()) {
+    cache->failed_keys.insert(key);
+    LogMusaClassicThunkGraph(
+        module_name, module_id, /*eligible=*/true, /*cache_hit=*/false,
+        /*captured=*/false,
+        absl::StrCat("capture_failed:", traced.status().message()),
+        thunk_sequence.size(), kernel_thunks, gemm_thunks,
+        cache->entries.size(), changes);
+    return MusaClassicThunkGraphExecution{};
+  }
+
+  auto command_buffer =
+      std::make_unique<se::CommandBuffer>(std::move(*traced));
+  TF_RETURN_IF_ERROR(executor->Submit(main_stream, *command_buffer));
+  cache->entries.emplace(std::move(key), std::move(command_buffer));
+  LogMusaClassicThunkGraph(module_name, module_id, /*eligible=*/true,
+                           /*cache_hit=*/false, /*captured=*/true, "",
+                           thunk_sequence.size(), kernel_thunks, gemm_thunks,
+                           cache->entries.size(), changes);
+  return MusaClassicThunkGraphExecution{/*executed=*/true};
+}
+
+void MaybeLogMusaThunkSummary(const std::string& module_name,
+                              ModuleIdentifier module_id,
+                              const ThunkSequence& thunk_sequence,
+                              se::Stream* stream) {
+  if (!IsMusaThunkDiagnosticsEnabled() ||
+      stream->parent()->platform()->id() !=
+          stream_executor::musa::kMusaPlatformId) {
+    return;
+  }
+
+  std::string module_key =
+      absl::StrCat(module_name, "#", module_id, "#", thunk_sequence.size());
+  static absl::Mutex logged_mu(absl::kConstInit);
+  static auto* logged_modules = new std::set<std::string>();
+  {
+    absl::MutexLock lock(&logged_mu);
+    if (!logged_modules->insert(module_key).second) {
+      return;
+    }
+  }
+
+  absl::flat_hash_map<std::string, int64_t> counts;
+  int64_t gemm_thunks = 0;
+  int64_t kernel_thunks = 0;
+  int64_t current_gemm_run = 0;
+  int64_t max_gemm_run = 0;
+  int64_t gemm_run_count = 0;
+  std::vector<int64_t> gemm_run_lengths;
+  absl::flat_hash_map<std::string, int64_t> transition_counts;
+  absl::flat_hash_map<std::string, int64_t> gemm_prev_counts;
+  absl::flat_hash_map<std::string, int64_t> gemm_next_counts;
+  std::vector<std::string> gemm_context_samples;
+  auto flush_gemm_run = [&] {
+    if (current_gemm_run <= 0) {
+      return;
+    }
+    ++gemm_run_count;
+    max_gemm_run = std::max(max_gemm_run, current_gemm_run);
+    gemm_run_lengths.push_back(current_gemm_run);
+    current_gemm_run = 0;
+  };
+  auto append_top_counts = [](const absl::flat_hash_map<std::string, int64_t>& map,
+                              int64_t limit) {
+    std::vector<std::pair<std::string, int64_t>> sorted(map.begin(), map.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+      if (a.second != b.second) {
+        return a.second > b.second;
+      }
+      return a.first < b.first;
+    });
+    std::vector<std::string> result;
+    for (const auto& [key, count] : sorted) {
+      if (result.size() >= limit) {
+        break;
+      }
+      result.push_back(absl::StrCat(key, "=", count));
+    }
+    return result;
+  };
+  for (int64_t i = 0; i < thunk_sequence.size(); ++i) {
+    const std::unique_ptr<Thunk>& thunk = thunk_sequence[i];
+    std::string kind = std::string(Thunk::KindToString(thunk->kind()));
+    ++counts[kind];
+    if (i > 0) {
+      std::string prev_kind =
+          std::string(Thunk::KindToString(thunk_sequence[i - 1]->kind()));
+      ++transition_counts[absl::StrCat(prev_kind, "->", kind)];
+    }
+    if (thunk->kind() == Thunk::Kind::kGemm ||
+        thunk->kind() == Thunk::Kind::kCublasLtMatmul) {
+      ++gemm_thunks;
+      ++current_gemm_run;
+      std::string prev_kind =
+          i == 0 ? "START"
+                 : std::string(
+                       Thunk::KindToString(thunk_sequence[i - 1]->kind()));
+      std::string next_kind =
+          i + 1 == thunk_sequence.size()
+              ? "END"
+              : std::string(Thunk::KindToString(thunk_sequence[i + 1]->kind()));
+      ++gemm_prev_counts[prev_kind];
+      ++gemm_next_counts[next_kind];
+      if (gemm_context_samples.size() < 12) {
+        std::string prev_annotation =
+            i == 0 ? "START"
+                   : ShortMusaThunkAnnotation(*thunk_sequence[i - 1]);
+        std::string next_annotation =
+            i + 1 == thunk_sequence.size()
+                ? "END"
+                : ShortMusaThunkAnnotation(*thunk_sequence[i + 1]);
+        gemm_context_samples.push_back(absl::StrCat(
+            "prev=", prev_kind, "(", prev_annotation, ") gemm=(",
+            ShortMusaThunkAnnotation(*thunk), ") next=", next_kind, "(",
+            next_annotation, ")"));
+      }
+    } else if (thunk->kind() == Thunk::Kind::kKernel) {
+      ++kernel_thunks;
+      flush_gemm_run();
+    } else {
+      flush_gemm_run();
+    }
+  }
+  flush_gemm_run();
+
+  std::vector<std::pair<std::string, int64_t>> sorted_counts(counts.begin(),
+                                                             counts.end());
+  std::sort(sorted_counts.begin(), sorted_counts.end(),
+            [](const auto& a, const auto& b) {
+              if (a.second != b.second) {
+                return a.second > b.second;
+              }
+              return a.first < b.first;
+            });
+  std::vector<std::string> parts;
+  parts.reserve(sorted_counts.size());
+  for (const auto& [kind, count] : sorted_counts) {
+    parts.push_back(absl::StrCat(kind, "=", count));
+  }
+
+  std::sort(gemm_run_lengths.begin(), gemm_run_lengths.end(),
+            [](int64_t a, int64_t b) { return a > b; });
+  const int64_t min_group_size = std::max<int64_t>(
+      1, ReadInt64Env("MUSA_XLA_GROUP_GEMM_THUNKS_MIN_GROUP_SIZE", 4));
+  const int64_t max_group_size = std::max<int64_t>(
+      min_group_size,
+      ReadInt64Env("MUSA_XLA_GROUP_GEMM_THUNKS_MAX_GROUP_SIZE", 64));
+  int64_t groupable_gemm_thunks = 0;
+  int64_t estimated_grouped_gemm_thunks = 0;
+  int64_t estimated_launch_reduction = 0;
+  for (int64_t run_length : gemm_run_lengths) {
+    if (run_length < min_group_size) {
+      continue;
+    }
+    int64_t grouped_launches =
+        (run_length + max_group_size - 1) / max_group_size;
+    groupable_gemm_thunks += run_length;
+    estimated_grouped_gemm_thunks += grouped_launches;
+    estimated_launch_reduction += run_length - grouped_launches;
+  }
+  int64_t nearby_gemm_windows = 0;
+  int64_t nearby_gemm_candidates = 0;
+  int64_t nearby_gemm_estimated_launch_reduction = 0;
+  absl::flat_hash_map<std::string, int64_t> nearby_separator_ops;
+  absl::flat_hash_map<std::string, int64_t> nearby_blocked_reasons;
+  auto separator_op_name = [](const Thunk& thunk) {
+    std::string annotation = thunk.profile_annotation();
+    constexpr char kHloOpMarker[] = "#hlo_op=";
+    size_t marker = annotation.find(kHloOpMarker);
+    if (marker != std::string::npos) {
+      size_t begin = marker + sizeof(kHloOpMarker) - 1;
+      size_t end = annotation.find('#', begin);
+      std::string name = annotation.substr(
+          begin, end == std::string::npos ? std::string::npos : end - begin);
+      size_t dot = name.find('.');
+      if (dot != std::string::npos) {
+        name.resize(dot);
+      }
+      if (!name.empty()) {
+        return name;
+      }
+    }
+    if (annotation.empty()) {
+      return std::string(Thunk::KindToString(thunk.kind()));
+    }
+    return annotation;
+  };
+  auto gemm_shape_key = [](const GemmThunk& gemm) {
+    const GemmConfig& config = gemm.config();
+    return absl::StrCat(config.output_layout.num_rows, "x",
+                        config.output_layout.num_cols, "x",
+                        config.lhs_layout.num_cols, ":alpha=(",
+                        config.alpha.real(), ",", config.alpha.imag(),
+                        "):beta=", config.beta);
+  };
+  const int64_t nearby_max_separators = std::max<int64_t>(
+      1, ReadInt64Env("MUSA_XLA_THUNK_DIAGNOSTICS_NEARBY_GEMM_MAX_SEPARATORS",
+                      8));
+  for (int64_t start = 0; start < thunk_sequence.size(); ++start) {
+    const GemmThunk* seed = thunk_sequence[start]->AsGemmThunk();
+    if (seed == nullptr) {
+      continue;
+    }
+    int64_t separator_count = 0;
+    int64_t window_gemms = 0;
+    absl::flat_hash_map<std::string, int64_t> window_shapes;
+    for (int64_t i = start; i < thunk_sequence.size(); ++i) {
+      const GemmThunk* gemm = thunk_sequence[i]->AsGemmThunk();
+      if (gemm != nullptr) {
+        ++window_gemms;
+        ++window_shapes[gemm_shape_key(*gemm)];
+        if (window_gemms >= max_group_size) {
+          break;
+        }
+        continue;
+      }
+      if (thunk_sequence[i]->kind() != Thunk::Kind::kKernel) {
+        break;
+      }
+      ++separator_count;
+      ++nearby_separator_ops[separator_op_name(*thunk_sequence[i])];
+      if (separator_count > nearby_max_separators) {
+        ++nearby_blocked_reasons["too_many_separators"];
+        break;
+      }
+    }
+    if (window_gemms < min_group_size) {
+      continue;
+    }
+    int64_t best_same_shape = 0;
+    for (const auto& [shape, count] : window_shapes) {
+      best_same_shape = std::max(best_same_shape, count);
+    }
+    if (best_same_shape < min_group_size) {
+      ++nearby_blocked_reasons["mixed_shapes"];
+      continue;
+    }
+    ++nearby_gemm_windows;
+    nearby_gemm_candidates += best_same_shape;
+    nearby_gemm_estimated_launch_reduction += best_same_shape - 1;
+  }
+  std::vector<std::string> top_gemm_runs;
+  for (int64_t length : gemm_run_lengths) {
+    if (top_gemm_runs.size() >= 8) {
+      break;
+    }
+    top_gemm_runs.push_back(absl::StrCat(length));
+  }
+  std::vector<std::string> top_transitions =
+      append_top_counts(transition_counts, 12);
+  std::vector<std::string> top_gemm_prev =
+      append_top_counts(gemm_prev_counts, 8);
+  std::vector<std::string> top_gemm_next =
+      append_top_counts(gemm_next_counts, 8);
+  std::vector<std::string> top_nearby_separator_ops =
+      append_top_counts(nearby_separator_ops, 12);
+  std::vector<std::string> top_nearby_blocked_reasons =
+      append_top_counts(nearby_blocked_reasons, 8);
+
+  LOG(INFO) << "[MUSA_XLA_THUNK_DIAGNOSTICS] module=" << module_name
+            << " module_id=" << module_id
+            << " total_thunks=" << thunk_sequence.size()
+            << " gemm_thunks=" << gemm_thunks
+            << " kernel_thunks=" << kernel_thunks
+            << " counts={" << absl::StrJoin(parts, ",") << "}"
+            << " gemm_run_count=" << gemm_run_count
+            << " max_gemm_run=" << max_gemm_run
+            << " top_gemm_runs={" << absl::StrJoin(top_gemm_runs, ",") << "}"
+            << " group_gemm_requested="
+            << IsTruthyEnv("MUSA_XLA_GROUP_GEMM_THUNKS")
+            << " group_min_size=" << min_group_size
+            << " group_max_size=" << max_group_size
+            << " groupable_gemm_thunks=" << groupable_gemm_thunks
+            << " estimated_grouped_gemm_thunks="
+            << estimated_grouped_gemm_thunks
+            << " estimated_launch_reduction=" << estimated_launch_reduction
+            << " nearby_gemm_windows=" << nearby_gemm_windows
+            << " nearby_gemm_candidates=" << nearby_gemm_candidates
+            << " nearby_gemm_estimated_launch_reduction="
+            << nearby_gemm_estimated_launch_reduction
+            << " nearby_gemm_separator_ops={"
+            << absl::StrJoin(top_nearby_separator_ops, ",") << "}"
+            << " nearby_gemm_blocked_reasons={"
+            << absl::StrJoin(top_nearby_blocked_reasons, ",") << "}"
+            << " top_transitions={"
+            << absl::StrJoin(top_transitions, ",") << "}"
+            << " gemm_prev_kinds={" << absl::StrJoin(top_gemm_prev, ",")
+            << "}"
+            << " gemm_next_kinds={" << absl::StrJoin(top_gemm_next, ",")
+            << "}"
+            << " gemm_context_samples={"
+            << absl::StrJoin(gemm_context_samples, " | ") << "}";
+}
+
+void MaybeLogMusaExecutionPath(const std::string& module_name,
+                               ModuleIdentifier module_id,
+                               se::Stream* stream, bool has_thunks,
+                               bool has_xla_runtime, bool has_gpu2_runtime) {
+  if (!IsMusaThunkDiagnosticsEnabled() ||
+      stream->parent()->platform()->id() !=
+          stream_executor::musa::kMusaPlatformId) {
+    return;
+  }
+  if (!IsMusaExecutionPathVerboseEnabled() &&
+      module_name.rfind("cluster_", 0) != 0) {
+    return;
+  }
+
+  const char* path = has_thunks       ? "classic_thunks"
+                     : has_xla_runtime ? "xla_runtime"
+                     : has_gpu2_runtime ? "gpu2_runtime"
+                                        : "none";
+  std::string module_key =
+      absl::StrCat(module_name, "#", module_id, "#", path);
+  static absl::Mutex logged_mu(absl::kConstInit);
+  static auto* logged_modules = new std::set<std::string>();
+  {
+    absl::MutexLock lock(&logged_mu);
+    if (!logged_modules->insert(module_key).second) {
+      return;
+    }
+  }
+
+  LOG(INFO) << "[MUSA_XLA_EXECUTION_PATH] module=" << module_name
+            << " module_id=" << module_id << " path=" << path
+            << " has_thunks=" << has_thunks
+            << " has_xla_runtime=" << has_xla_runtime
+            << " has_gpu2_runtime=" << has_gpu2_runtime;
+}
+
 }  // namespace
 
 StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::Create(Params params) {
@@ -164,7 +840,48 @@ StatusOr<std::unique_ptr<GpuExecutable>> GpuExecutable::Create(Params params) {
   std::unique_ptr<GpuExecutable> result(new GpuExecutable(std::move(params)));
 
   if (std::holds_alternative<OwnedThunkSequence>(executable)) {
-    result->thunks_ = std::move(std::get<OwnedThunkSequence>(executable));
+    auto thunks = std::move(std::get<OwnedThunkSequence>(executable));
+    if (IsTruthyEnv("MUSA_XLA_SMALL_GEMM_ACCUM_THUNKS")) {
+      MusaSmallGemmAccumRewriteOptions options;
+      options.min_chain_size = std::max<int64_t>(
+          2, ReadInt64Env("MUSA_XLA_SMALL_GEMM_ACCUM_MIN_CHAIN_SIZE", 4));
+      options.max_chain_size = std::max<int64_t>(
+          options.min_chain_size,
+          ReadInt64Env("MUSA_XLA_SMALL_GEMM_ACCUM_MAX_CHAIN_SIZE", 64));
+      options.max_k =
+          std::max<int64_t>(1, ReadInt64Env("MUSA_XLA_SMALL_GEMM_ACCUM_MAX_K",
+                                           64));
+      options.require_custom_kernel =
+          IsTruthyEnv("MUSA_XLA_SMALL_GEMM_ACCUM_REQUIRE_CUSTOM_KERNEL");
+      options.log = IsTruthyEnv("MUSA_XLA_SMALL_GEMM_ACCUM_LOG") ||
+                    IsMusaThunkDiagnosticsEnabled();
+      MusaSmallGemmAccumRewriteStats stats;
+      TF_ASSIGN_OR_RETURN(
+          thunks, RewriteMusaSmallGemmAccumThunks(std::move(thunks), options,
+                                                  &stats));
+    }
+    const bool group_gemm_thunks_requested =
+        IsTruthyEnv("MUSA_XLA_GROUP_GEMM_THUNKS");
+    const bool group_gemm_cross_kernel_diag_requested =
+        IsTruthyEnv("MUSA_XLA_GROUP_GEMM_THUNKS_CROSS_KERNEL_DIAG");
+    if (group_gemm_thunks_requested || group_gemm_cross_kernel_diag_requested) {
+      MusaGroupedGemmRewriteOptions options;
+      options.min_group_size = std::max<int64_t>(
+          1, ReadInt64Env("MUSA_XLA_GROUP_GEMM_THUNKS_MIN_GROUP_SIZE", 4));
+      options.max_group_size =
+          std::max<int64_t>(options.min_group_size,
+                            ReadInt64Env("MUSA_XLA_GROUP_GEMM_THUNKS_MAX_GROUP_SIZE",
+                                         64));
+      options.diagnostic_only = !group_gemm_thunks_requested;
+      options.log = IsTruthyEnv("MUSA_XLA_GROUP_GEMM_THUNKS_LOG") ||
+                    IsMusaThunkDiagnosticsEnabled() ||
+                    group_gemm_cross_kernel_diag_requested;
+      MusaGroupedGemmRewriteStats stats;
+      TF_ASSIGN_OR_RETURN(thunks,
+                          RewriteMusaGroupGemmThunks(std::move(thunks),
+                                                     options, &stats));
+    }
+    result->thunks_ = std::move(thunks);
     return result;
   }
 
@@ -206,6 +923,8 @@ GpuExecutable::GpuExecutable(GpuExecutable::Params params)
       constants_(std::move(params.constants)),
       output_info_(std::move(params.output_info)),
       enable_debug_info_manager_(params.enable_debug_info_manager) {
+  musa_classic_thunk_graph_cache_ =
+      std::make_unique<MusaClassicThunkGraphCache>();
 #if TENSORFLOW_USE_ROCM
   // ROCm uses hsaco hashes to distinguish between modules.
   // Bad things happen if multiple modules with identical code are loaded.
@@ -273,8 +992,10 @@ Status ExecuteThunks(const std::string& module_name, ModuleIdentifier module_id,
                      const ThunkSequence& thunk_sequence,
                      const ServiceExecutableRunOptions* run_options,
                      const BufferAllocations& buffer_allocations,
+                     const std::vector<BufferAllocation>& allocations,
                      bool block_host_until_done,
-                     bool use_highest_priority_for_async_stream) {
+                     bool use_highest_priority_for_async_stream,
+                     MusaClassicThunkGraphCache* classic_thunk_graph_cache) {
   se::Stream* main_stream = run_options->stream();
   se::StreamExecutor* executor = main_stream->parent();
   stream_executor::StreamPriority stream_priority =
@@ -308,6 +1029,44 @@ Status ExecuteThunks(const std::string& module_name, ModuleIdentifier module_id,
                            module_id_str);
   });
 
+  MaybeLogMusaThunkSummary(module_name, module_id, thunk_sequence, main_stream);
+
+  const bool thunk_timing_enabled =
+      IsMusaThunkTimingEnabled() &&
+      main_stream->parent()->platform()->id() ==
+          stream_executor::musa::kMusaPlatformId;
+  if (IsMusaClassicThunkGraphEnabled()) {
+    if (main_stream->parent()->platform()->id() !=
+        stream_executor::musa::kMusaPlatformId) {
+      LogMusaClassicThunkGraph(module_name, module_id, /*eligible=*/false,
+                               /*cache_hit=*/false, /*captured=*/false,
+                               "not_musa", thunk_sequence.size(), 0, 0, 0);
+    } else if (thunk_timing_enabled) {
+      LogMusaClassicThunkGraph(module_name, module_id, /*eligible=*/false,
+                               /*cache_hit=*/false, /*captured=*/false,
+                               "thunk_timing_enabled",
+                               thunk_sequence.size(), 0, 0, 0);
+    } else {
+      TF_ASSIGN_OR_RETURN(MusaClassicThunkGraphExecution graph_execution,
+                          TryExecuteMusaClassicThunkGraph(
+                              module_name, module_id, thunk_sequence,
+                              run_options, buffer_allocations, allocations,
+                              classic_thunk_graph_cache));
+      if (graph_execution.executed) {
+        return MaybeSyncAndProfile(run_options, start_nanos,
+                                   block_host_until_done ? main_stream
+                                                         : nullptr);
+      }
+    }
+  }
+  std::vector<MusaThunkTimingItem> thunk_timings;
+  absl::flat_hash_map<std::string, MusaThunkKindTiming> thunk_kind_totals;
+  int64_t thunk_timing_total_us = 0;
+  if (thunk_timing_enabled) {
+    thunk_timings.reserve(thunk_sequence.size());
+  }
+
+  int64_t thunk_index = 0;
   for (const std::unique_ptr<Thunk>& thunk : thunk_sequence) {
     // Annotate execution of this op if tracing was enabled when we started
     // running this module.  If tracing is enabled *while* we're running the
@@ -323,7 +1082,25 @@ Status ExecuteThunks(const std::string& module_name, ModuleIdentifier module_id,
 
     Thunk::ExecuteParams thunk_params{*run_options, buffer_allocations,
                                       main_stream, async_comms_streams};
-    TF_RETURN_IF_ERROR(thunk->ExecuteOnStream(thunk_params));
+    if (thunk_timing_enabled) {
+      TF_RETURN_IF_ERROR(ExecuteThunkWithOptionalTiming(
+          thunk_index, *thunk, thunk_params, main_stream, &thunk_timings,
+          &thunk_kind_totals, &thunk_timing_total_us));
+    } else {
+      TF_RETURN_IF_ERROR(thunk->ExecuteOnStream(thunk_params));
+    }
+    ++thunk_index;
+  }
+  if (thunk_timing_enabled) {
+    LOG(INFO) << "[MUSA_THUNK_TIMING] module=" << module_name
+              << " module_id=" << module_id
+              << " total_thunks=" << thunk_sequence.size()
+              << " total_us=" << thunk_timing_total_us
+              << " kind_totals={"
+              << FormatMusaThunkTimingKindTotals(thunk_kind_totals) << "}"
+              << " top_thunks={"
+              << FormatMusaThunkTimingTopThunks(std::move(thunk_timings))
+              << "}";
   }
   return MaybeSyncAndProfile(run_options, start_nanos,
                              block_host_until_done ? main_stream : nullptr);
@@ -937,6 +1714,11 @@ Status GpuExecutable::ExecuteThunksOrXlaRuntime(
     unique_id = module().unique_id();
   }
 
+  MaybeLogMusaExecutionPath(module_name_, unique_id, run_options->stream(),
+                            static_cast<bool>(thunks_),
+                            static_cast<bool>(gpu_runtime_executable_),
+                            static_cast<bool>(gpu2_runtime_executable_));
+
   if (thunks_) {
     se::StreamExecutor* executor = run_options->stream()->parent();
     for (const std::unique_ptr<Thunk>& thunk : *thunks_) {
@@ -945,12 +1727,13 @@ Status GpuExecutable::ExecuteThunksOrXlaRuntime(
 
     return ExecuteThunks(
         module_name_, unique_id, *thunks_, run_options, buffer_allocations,
-        block_host_until_done,
+        allocations_, block_host_until_done,
         /*use_highest_priority_for_async_stream*/
         has_module() ? module_config()
                            .debug_options()
                            .xla_gpu_enable_highest_priority_async_stream()
-                     : false);
+                     : false,
+        musa_classic_thunk_graph_cache_.get());
   }
 
   // Match IrEmitter's temp buffer allocation for kernel launches. See
@@ -1129,6 +1912,8 @@ GpuExecutable::GpuExecutable(
       constants_(std::move(constants)),
       output_info_(std::move(output_info)),
       enable_debug_info_manager_(true) {
+  musa_classic_thunk_graph_cache_ =
+      std::make_unique<MusaClassicThunkGraphCache>();
   if (has_module()) {
     XlaDebugInfoManager::Get()->RegisterModule(shared_module(),
                                                debug_buffer_assignment_);

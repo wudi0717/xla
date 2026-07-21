@@ -271,11 +271,14 @@ Stream::Stream(StreamExecutor *parent)
 Stream::~Stream() {
   VLOG_CALL();
 
-  // Ensure the stream is completed.
-  auto status = BlockHostUntilDone();
-  if (!status.ok()) {
-    LOG(WARNING) << "Error blocking host until done in stream destructor: "
-                 << status;
+  // Ensure the stream is completed unless a custom stream implementation
+  // already handled synchronization before destroying its native handle.
+  if (!destructor_synchronization_handled_) {
+    auto status = BlockHostUntilDone();
+    if (!status.ok()) {
+      LOG(WARNING) << "Error blocking host until done in stream destructor: "
+                   << status;
+    }
   }
   temporary_memory_manager_.ForceDeallocateAll();
   RunAfterBlockHostUntilDoneCallbacks();

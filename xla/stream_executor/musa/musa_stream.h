@@ -36,14 +36,18 @@ class MusaExecutor;
 
 class MusaStream : public StreamCommon {
  public:
+  using UnregisterStream = absl::AnyInvocable<void(MUstream)>;
+
   static tsl::StatusOr<std::unique_ptr<Stream>> Create(
       StreamExecutor* executor, MUcontext context,
-      std::optional<std::variant<StreamPriority, int>> priority);
+      std::optional<std::variant<StreamPriority, int>> priority,
+      UnregisterStream unregister_stream);
 
   MusaStream(StreamExecutor* executor,
              MUcontext context,
              std::optional<std::variant<StreamPriority, int>> priority,
-             MUstream stream_handle, MUevent completed_event);
+             MUstream stream_handle, MUevent completed_event,
+             UnregisterStream unregister_stream);
   ~MusaStream() override;
 
   tsl::Status WaitFor(Stream* other) override;
@@ -92,6 +96,7 @@ class MusaStream : public StreamCommon {
   MUcontext context_;
   MUstream stream_handle_;
   MUevent completed_event_;
+  UnregisterStream unregister_stream_;
   absl::Mutex submit_mu_;
   absl::Mutex debug_launch_checkpoints_mu_;
   std::deque<DebugLaunchCheckpoint> debug_launch_checkpoints_

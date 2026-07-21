@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "xla/pjrt/gpu/se_gpu_pjrt_client.h"
 
+#include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -705,15 +707,48 @@ StatusOr<std::unique_ptr<se::MultiDeviceAdapter>> CreateCudaAsyncAllocator(
 // Builds a LocalDeviceState for each GPU present.
 StatusOr<std::map<int, std::unique_ptr<LocalDeviceState>>>
 BuildLocalDeviceStates(LocalClient* xla_client) {
+  auto read_int_env = [](const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+      return default_value;
+    }
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+      return default_value;
+    }
+    return static_cast<int>(parsed);
+  };
+  auto has_env = [](const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0';
+  };
+  const int max_inflight_computations = read_int_env(
+      "MUSA_PJRT_MAX_INFLIGHT_COMPUTATIONS", 32);
+  std::optional<LocalDeviceState::StreamOptions> stream_options = std::nullopt;
+  if (has_env("MUSA_PJRT_NUM_DEVICE_TO_HOST_STREAMS") ||
+      has_env("MUSA_PJRT_NUM_DEVICE_TO_DEVICE_STREAMS")) {
+    LocalDeviceState::StreamOptions options;
+    options.num_device_to_host_streams = read_int_env(
+        "MUSA_PJRT_NUM_DEVICE_TO_HOST_STREAMS",
+        options.num_device_to_host_streams);
+    options.num_device_to_device_streams = read_int_env(
+        "MUSA_PJRT_NUM_DEVICE_TO_DEVICE_STREAMS",
+        options.num_device_to_device_streams);
+    stream_options = options;
+  }
   std::map<int, std::unique_ptr<LocalDeviceState>> addressable_devices;
+  int local_device_ordinal = 0;
   for (se::StreamExecutor* executor :
        xla_client->backend().stream_executors()) {
+    const int logical_device_ordinal = local_device_ordinal++;
     addressable_devices.emplace(
-        executor->device_ordinal(),
+        logical_device_ordinal,
         std::make_unique<LocalDeviceState>(
             executor, xla_client, LocalDeviceState::kComputeSynchronized,
-            /*max_inflight_computations=*/32,
-            /*allow_event_reuse=*/true, /*use_callback_stream=*/true));
+            max_inflight_computations,
+            /*allow_event_reuse=*/true, /*use_callback_stream=*/true,
+            executor->device_ordinal(), stream_options));
   }
   return std::move(addressable_devices);
 }
@@ -873,15 +908,12 @@ Status BuildDistributedDevices(
   }
   local_topology.set_boot_id(boot_id_str);
   for (const auto& ordinal_and_device : local_device_states) {
-    const se::Platform* platform =
-        ordinal_and_device.second->executor()->platform();
-    TF_ASSIGN_OR_RETURN(
-        std::unique_ptr<xla::se::DeviceDescription> desc,
-        platform->DescriptionForDevice(ordinal_and_device.first));
+    const se::DeviceDescription& desc =
+        ordinal_and_device.second->executor()->GetDeviceDescription();
     DeviceProto* device_proto = local_topology.add_devices();
     device_proto->set_local_device_ordinal(ordinal_and_device.first);
-    device_proto->set_name(desc->name());
-    device_proto->set_vendor(desc->device_vendor());
+    device_proto->set_name(desc.name());
+    device_proto->set_vendor(desc.device_vendor());
   }
   VLOG(3) << "GPU Local Topology:\n" << local_topology.DebugString();
   TF_RETURN_IF_ERROR(

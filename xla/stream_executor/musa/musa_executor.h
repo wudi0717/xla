@@ -35,7 +35,12 @@ limitations under the License.
 #include "xla/stream_executor/stream_executor_internal.h"
 
 namespace stream_executor {
+class Stream;
+
 namespace musa {
+
+MUstream GetMusaStreamHandle(Stream* stream);
+absl::Mutex* GetMusaStreamSubmitMutex(Stream* stream);
 
 class MusaExecutor : public ::stream_executor::internal::StreamExecutorInterface {
  public:
@@ -102,6 +107,7 @@ class MusaExecutor : public ::stream_executor::internal::StreamExecutorInterface
       ::stream_executor::internal::StreamExecutorInterface* other) override;
 
   blas::BlasSupport* CreateBlas() override;
+  dnn::DnnSupport* CreateDnn() override;
   bool DeviceMemoryUsage(int64_t* free, int64_t* total) const override;
   tsl::StatusOr<std::unique_ptr<DeviceDescription>> CreateDeviceDescription()
       const override;

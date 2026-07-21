@@ -129,20 +129,25 @@ static absl::Status LaunchImpl(
     execution_stream = region_status->GetNextStream();
   }
 
-  LogMusaRuntimeCustomCallBegin(
-      "xla.gpu.func.launch",
-      absl::StrCat("kernel=", name, " requested_stream=", stream_id,
-                   " execution_stream=", DebugString(execution_stream),
-                   " grid=", grid_size_x, "x", grid_size_y, "x", grid_size_z,
-                   " block=", block_size_x, "x", block_size_y, "x",
-                   block_size_z, " shmem=", shared_memory_bytes,
-                   " args=", args.size()));
+  const bool trace_enabled = IsMusaDebugRuntimeTraceEnabled();
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallBegin(
+        "xla.gpu.func.launch",
+        absl::StrCat("kernel=", name, " requested_stream=", stream_id,
+                     " execution_stream=", DebugString(execution_stream),
+                     " grid=", grid_size_x, "x", grid_size_y, "x",
+                     grid_size_z, " block=", block_size_x, "x", block_size_y,
+                     "x", block_size_z, " shmem=", shared_memory_bytes,
+                     " args=", args.size()));
+  }
 
   // Execute device kernel on the execution stream.
   absl::Status status = ExecuteKernelOnStream(**kernel, buffer_args,
                                               launch_dimensions,
                                               execution_stream);
-  LogMusaRuntimeCustomCallEnd("xla.gpu.func.launch", status);
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallEnd("xla.gpu.func.launch", status);
+  }
   return status;
 }
 

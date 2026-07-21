@@ -153,6 +153,34 @@ cc_library(
 )
 
 cc_library(
+    name = "mudnn_plugin",
+    srcs = ["musa_dnn.cc"],
+    hdrs = ["musa_dnn.h"],
+    deps = [
+        ":musa_executor",
+        ":musa_platform_id",
+        "//xla/stream_executor:device_memory",
+        "//xla/stream_executor:dnn",
+        "//xla/stream_executor:plugin_registry",
+        "//xla/stream_executor:stream_executor_headers",
+        "//xla/stream_executor/platform",
+        "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
+        "@local_config_musa//musa:musa",
+        "@local_config_musa//musa:musa_rpath",
+        "@local_config_musa//musa:mudnn",
+        "@local_config_musa//musa:musa_headers",
+        "@local_tsl//tsl/platform:errors",
+        "@local_tsl//tsl/platform:logging",
+        "@local_tsl//tsl/platform:status",
+        "@local_tsl//tsl/platform:statusor",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
     name = "musa_executor",
     srcs = ["musa_executor.cc"],
     hdrs = ["musa_executor.h"],
@@ -198,6 +226,7 @@ cc_library(
     deps = [
         ":musa_executor",
         ":mublas_plugin",
+        ":mudnn_plugin",
         ":musa_platform_id",
         ":musa_status",
         "//xla/stream_executor:device_description",

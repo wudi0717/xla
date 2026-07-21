@@ -23,6 +23,7 @@ limitations under the License.
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/log/log.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_format.h"
@@ -600,30 +601,53 @@ int64_t GetSizeOfShape(const Shape& shape, int pointer_size) {
 Status ScheduleGpuModule(HloModule* module, int64_t pointer_size,
                          int64_t memory_limit,
                          const se::DeviceDescription& gpu_device_info) {
+  int64_t musa_transitional_custom_calls = 0;
+  for (HloComputation* computation : module->MakeNonfusionComputations()) {
+    for (HloInstruction* instr : computation->instructions()) {
+      if (instr->opcode() == HloOpcode::kCustomCall &&
+          (instr->custom_call_target() == "__musa$gemm_beta_chain" ||
+           instr->custom_call_target() == "__musa$gemm_epilogue" ||
+           instr->custom_call_target() == "__musa$pointer_array_gemm" ||
+           instr->custom_call_target() == "__musa$small_k_dot")) {
+        ++musa_transitional_custom_calls;
+        const auto& custom_call =
+            static_cast<const HloCustomCallInstruction&>(*instr);
+      }
+    }
+  }
+
   HloPassPipeline prepare_pipeline("p2p-schedule-preparation");
   prepare_pipeline.AddPass<P2PSchedulePreparation>();
   TF_RETURN_IF_ERROR(prepare_pipeline.Run(module).status());
-
   TF_ASSIGN_OR_RETURN(
       HloSchedule schedule,
       ScheduleGpuModuleWithMemoryScheduler(module, pointer_size));
   TF_RETURN_IF_ERROR(module->set_schedule(std::move(schedule)));
 
+
+  const bool enable_latency_hiding_scheduler =
+      module->config()
+          .debug_options()
+          .xla_gpu_enable_latency_hiding_scheduler();
+
   // Tag the module with its 128 bit fingerprint. The fingerprint should include
   // instruction name with ids.
-  std::string fingerprint = module->GetFingerprint128(
-      HloPrintOptions::Canonical().set_print_backend_config(true));
+  std::string fingerprint;
+  if (musa_transitional_custom_calls > 0) {
+    // These MUSA custom-calls are inserted after the normal HLO optimization
+    // pipeline and consumed by custom thunk paths. Avoid the expensive
+    // canonical HLO fingerprint on these transitional custom-call paths.
+    fingerprint = "musa_transitional_custom_call";
+  } else {
+    fingerprint = module->GetFingerprint128(
+        HloPrintOptions::Canonical().set_print_backend_config(true));
+  }
   HloInstruction* root = module->entry_computation()->root_instruction();
   FrontendAttributes attributes;
   (*attributes.mutable_map())[std::string(kFingerprintBeforeLHS)] = fingerprint;
   root->add_frontend_attributes(attributes);
   VLOG(1) << "Fingerprint before LHS for module " << module->name() << "("
           << module->unique_id() << ") = " << fingerprint;
-
-  const bool enable_latency_hiding_scheduler =
-      module->config()
-          .debug_options()
-          .xla_gpu_enable_latency_hiding_scheduler();
 
   if (!enable_latency_hiding_scheduler) {
     return OkStatus();

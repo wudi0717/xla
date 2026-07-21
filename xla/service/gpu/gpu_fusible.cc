@@ -16,6 +16,7 @@ limitations under the License.
 #include "xla/service/gpu/gpu_fusible.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iterator>
 #include <optional>
 #include <stack>
@@ -43,6 +44,23 @@ bool HasAnyTiledTransposeRoot(const HloComputation& computation) {
                                      *instr, FindNonTrivialHero(*instr))
                               .has_value();
                         });
+}
+
+int64_t MaxOperandsAndOutputsPerFusionForBudget() {
+  static const int64_t limit = [] {
+    const char* env = std::getenv("MUSA_XLA_MAX_FUSION_OPERANDS");
+    if (env == nullptr || env[0] == '\0') {
+      return MaxOperandsAndOutputsPerFusion();
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (end == env || parsed < MaxOperandsAndOutputsPerFusion() ||
+        parsed > 256) {
+      return MaxOperandsAndOutputsPerFusion();
+    }
+    return static_cast<int64_t>(parsed);
+  }();
+  return limit;
 }
 
 }  // namespace
@@ -687,9 +705,11 @@ FusionDecision FusionFitsInBudget(const HloInstruction& instr1,
   //
   // This fact may be enough to let us avoid having to compute the true total
   // number of operands, which can be expensive.
+  const int64_t max_operands_and_outputs =
+      MaxOperandsAndOutputsPerFusionForBudget();
   if (instr1.operand_count() + instr2.operand_count() - 1 +
           num_output_buffers <=
-      MaxOperandsAndOutputsPerFusion()) {
+      max_operands_and_outputs) {
     return {};
   } else {
     VLOG(5) << "Operand count of "
@@ -698,7 +718,7 @@ FusionDecision FusionFitsInBudget(const HloInstruction& instr1,
             << " ) = " << instr2.operand_count()
             << " and num_output_buffers = " << num_output_buffers
             << " is bigger than the bound of "
-            << MaxOperandsAndOutputsPerFusion();
+            << max_operands_and_outputs;
   }
 
   // Compute the precise number of operands to the new fusion.
@@ -720,7 +740,7 @@ FusionDecision FusionFitsInBudget(const HloInstruction& instr1,
   }
 
   // Does the new fusion have more operands and outputs than the max?
-  if (operands.size() + num_output_buffers > MaxOperandsAndOutputsPerFusion()) {
+  if (operands.size() + num_output_buffers > max_operands_and_outputs) {
     return "Number of operands and output buffers is larger than allowed "
            "budget per fusion";
   }

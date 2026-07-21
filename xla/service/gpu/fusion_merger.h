@@ -16,6 +16,8 @@ limitations under the License.
 #ifndef XLA_SERVICE_GPU_FUSION_MERGER_H_
 #define XLA_SERVICE_GPU_FUSION_MERGER_H_
 
+#include <cstdint>
+
 #include "xla/hlo/ir/hlo_module.h"
 #include "xla/service/gpu/gpu_hlo_cost_analysis.h"
 #include "xla/service/hlo_pass_interface.h"
@@ -23,6 +25,13 @@ limitations under the License.
 
 namespace xla {
 namespace gpu {
+
+struct FusionMergerOptions {
+  bool materialize_large_multi_user_reduction_producer = false;
+  int64_t min_materialized_producer_elements = 10000000;
+  int64_t min_materialized_producer_operands = 16;
+  bool log_materialized_reduction_producers = false;
+};
 
 // An HLO pass that attempts to merge fusion instructions to reduce memory
 // bandwidth requirements and kernel launch overhead.
@@ -62,8 +71,11 @@ namespace gpu {
 class FusionMerger : public HloModulePass {
  public:
   explicit FusionMerger(const se::DeviceDescription& d,
-                        HloCostAnalysis::ShapeSizeFunction f)
-      : gpu_device_info_(d), shape_size_function_(f) {}
+                        HloCostAnalysis::ShapeSizeFunction f,
+                        FusionMergerOptions options = FusionMergerOptions())
+      : gpu_device_info_(d),
+        shape_size_function_(f),
+        options_(options) {}
   absl::string_view name() const override { return "fusion_merger"; }
 
   using HloPassInterface::Run;
@@ -74,6 +86,7 @@ class FusionMerger : public HloModulePass {
  private:
   se::DeviceDescription gpu_device_info_;
   HloCostAnalysis::ShapeSizeFunction shape_size_function_;
+  FusionMergerOptions options_;
 };
 
 }  // namespace gpu

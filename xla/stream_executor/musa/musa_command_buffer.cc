@@ -21,13 +21,6 @@
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/stream_executor.h"
 
-extern "C" {
-MUresult MUSAAPI muStreamBeginCaptureToGraph(
-    MUstream hStream, MUgraph hGraph, const MUgraphNode* dependencies,
-    const MUgraphEdgeData* dependencyData, size_t numDependencies,
-    MUstreamCaptureMode mode);
-}
-
 namespace stream_executor {
 namespace musa {
 namespace {
@@ -131,11 +124,8 @@ tsl::Status MusaCommandBuffer::Trace(
 
   uint64_t start_nanos = tsl::Env::Default()->NowNanos();
   TF_RETURN_IF_ERROR(musa::ToStatus(
-      muStreamBeginCaptureToGraph(AsMusaStream(stream)->stream_handle(), graph_,
-                                  /*dependencies=*/nullptr,
-                                  /*dependencyData=*/nullptr,
-                                  /*numDependencies=*/0,
-                                  MU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+      muStreamBeginCapture(AsMusaStream(stream)->stream_handle(),
+                           MU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
       "Failed to begin stream capture to MUSA graph"));
 
   auto traced = function();
@@ -148,13 +138,35 @@ tsl::Status MusaCommandBuffer::Trace(
   (void)start_nanos;
   (void)end_nanos;
 
+  if (captured_graph == nullptr) {
+    return tsl::errors::Internal(
+        "MUSA stream capture returned an empty graph handle");
+  }
   if (!traced.ok()) {
+    auto destroy_status = musa::ToStatus(
+        muGraphDestroy(captured_graph),
+        "Failed to destroy MUSA graph after trace failure");
+    if (!destroy_status.ok()) {
+      return destroy_status;
+    }
     return tsl::errors::Internal("Failed to capture MUSA graph: ",
                                  traced.message());
   }
-  if (captured_graph != graph_) {
-    return tsl::errors::Internal("Captured graph does not match command buffer graph");
+
+  auto destroy_status = musa::ToStatus(
+      muGraphDestroy(graph_),
+      "Failed to replace empty MUSA graph with captured graph");
+  if (!destroy_status.ok()) {
+    auto captured_destroy_status = musa::ToStatus(
+        muGraphDestroy(captured_graph),
+        "Failed to destroy captured MUSA graph after replacement failure");
+    if (!captured_destroy_status.ok()) {
+      LOG(ERROR) << captured_destroy_status;
+    }
+    return destroy_status;
   }
+  graph_ = captured_graph;
+
   size_t num_root_nodes = 0;
   TF_RETURN_IF_ERROR(musa::ToStatus(
       muGraphGetRootNodes(captured_graph, nullptr, &num_root_nodes),

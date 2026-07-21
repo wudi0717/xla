@@ -17,6 +17,7 @@ limitations under the License.
 #define XLA_SERVICE_GPU_FUSION_PIPELINE_H_
 
 #include "xla/service/hlo_cost_analysis.h"
+#include "xla/service/gpu/fusion_merger.h"
 #include "xla/service/hlo_pass_pipeline.h"
 #include "xla/stream_executor/device_description.h"
 #include "xla/xla.pb.h"
@@ -28,7 +29,8 @@ namespace gpu {
 HloPassPipeline FusionPipeline(
     const DebugOptions& debug_options,
     HloCostAnalysis::ShapeSizeFunction shape_size_bytes_function,
-    const se::DeviceDescription& gpu_device_info);
+    const se::DeviceDescription& gpu_device_info,
+    FusionMergerOptions fusion_merger_options = FusionMergerOptions());
 
 // Function wrapper around the horizontal XLA GPU fusion pipeline.
 HloPassPipeline HorizontalFusionPipeline(

@@ -3,6 +3,7 @@ import sys
 import time
 import argparse
 import ctypes
+import gc
 import json
 import logging
 import re
@@ -115,6 +116,9 @@ if use_musa_xla:
         os.environ.pop("MUSA_PJRT_SERIALIZE_EXECUTE", None)
         os.environ.pop("MUSA_PJRT_DROP_EXECUTE_DEVICE", None)
         os.environ.pop("MUSA_PJRT_FORCE_HOST_BUFFER_COPY", None)
+        # Per-transfer logging is useful for diagnosis but distorts latency and
+        # can leave a very visible alternating fast/slow pattern.
+        os.environ["MUSA_PJRT_DEBUG_LOG"] = "0"
     os.environ.pop("MUSA_XLA_AVOID_INTERLEAVED_BATCH_GEMM_LAYOUT", None)
     os.environ["MUSA_NPD_IS_PLUGGABLE_DEVICE"] = "1"
     os.environ["MUSA_NPD_USE_PJRT_ON_DEMAND_COMPILE"] = "1"
@@ -127,6 +131,9 @@ if use_musa_xla:
         os.environ.setdefault("MUSA_PJRT_FORCE_HOST_BUFFER_COPY", "0")
         os.environ.setdefault("MUSA_PJRT_MAX_INFLIGHT_TRANSFERS", "0")
         os.environ.setdefault("MUSA_PJRT_MAX_INFLIGHT_EXECUTES", "0")
+    # Keep H2D copies on the same stream as the compiled computation. The
+    # actual feed arrays are allocated from pinned host memory below.
+    os.environ.setdefault("MUSA_PINNED_H2D_ON_COMPUTE_STREAM", "1")
     tf_xla_flags = os.environ.get("TF_XLA_FLAGS", "")
     required_xla_flags = [
         "--tf_xla_auto_jit=2",
@@ -185,6 +192,110 @@ from tensorflow.core.framework import graph_pb2
 import tensorflow.compat.v1 as tf
 
 tf.disable_eager_execution()
+
+
+def _mode_enabled(mode: str, auto_default: bool) -> bool:
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return auto_default
+
+
+class PinnedHostArray:
+    """NumPy storage backed by MUSA page-locked host memory."""
+
+    _lib = None
+
+    @classmethod
+    def lib(cls):
+        if cls._lib is None:
+            library_path = os.environ.get(
+                "MUSA_RUNTIME_LIBRARY", "/usr/local/musa/lib/libmusart.so"
+            )
+            cls._lib = ctypes.CDLL(library_path)
+            cls._lib.musaHostAlloc.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_size_t,
+                ctypes.c_uint,
+            ]
+            cls._lib.musaHostAlloc.restype = ctypes.c_int
+            cls._lib.musaFreeHost.argtypes = [ctypes.c_void_p]
+            cls._lib.musaFreeHost.restype = ctypes.c_int
+        return cls._lib
+
+    def __init__(self, source):
+        source = np.ascontiguousarray(source)
+        self.shape = source.shape
+        self.dtype = source.dtype
+        self.nbytes = max(1, int(source.nbytes))
+        self.ptr = ctypes.c_void_p()
+        err = self.lib().musaHostAlloc(ctypes.byref(self.ptr), self.nbytes, 0)
+        if err != 0 or not self.ptr.value:
+            raise RuntimeError(
+                f"musaHostAlloc failed: err={err}, bytes={self.nbytes}"
+            )
+        buffer_type = ctypes.c_char * self.nbytes
+        self.buffer = buffer_type.from_address(self.ptr.value)
+        self.array = np.ndarray(
+            shape=self.shape, dtype=self.dtype, buffer=self.buffer, order="C"
+        )
+        np.copyto(self.array, source)
+
+    def close(self):
+        ptr = getattr(self, "ptr", None)
+        if ptr is not None and ptr.value:
+            self.lib().musaFreeHost(ptr)
+            self.ptr = ctypes.c_void_p()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def prepare_pinned_feed(feed_dict):
+    """Copy numeric feeds once into page-locked arrays; fall back atomically."""
+
+    holders = []
+    pinned_feed = {}
+    try:
+        for name, value in feed_dict.items():
+            array = np.asarray(value)
+            if array.dtype.kind not in ("b", "i", "u", "f", "c"):
+                pinned_feed[name] = value
+                continue
+            holder = PinnedHostArray(array)
+            holders.append(holder)
+            pinned_feed[name] = holder.array
+    except Exception:
+        for holder in holders:
+            holder.close()
+        raise
+    return pinned_feed, holders
+
+
+def _trimmed_mean(values, trim_ratio=0.1):
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    trim = int(len(ordered) * trim_ratio)
+    if trim == 0 or trim * 2 >= len(ordered):
+        return float(np.mean(ordered))
+    return float(np.mean(ordered[trim:-trim]))
+
+
+def _latency_pattern(values):
+    """Summarize alternating latency without changing the measured samples."""
+
+    if len(values) < 4:
+        return {"even_p50": 0.0, "odd_p50": 0.0, "ratio": 1.0}
+    even_p50 = float(np.percentile(values[0::2], 50))
+    odd_p50 = float(np.percentile(values[1::2], 50))
+    low = min(even_p50, odd_p50)
+    ratio = max(even_p50, odd_p50) / low if low > 0.0 else float("inf")
+    return {"even_p50": even_p50, "odd_p50": odd_p50, "ratio": ratio}
 
 
 # ==========================================
@@ -649,14 +760,40 @@ def summarize_feed_data(feed_dict, warmup_runs, num_runs):
 # ==========================================
 # 4. 执行推理
 # ==========================================
-def run_inference(graph_def, feed_dict, output_node_name, device="cpu", xla=False, num_runs=100, warmup_runs=10):
+def run_inference(
+    graph_def,
+    feed_dict,
+    output_node_name,
+    device="cpu",
+    xla=False,
+    num_runs=100,
+    warmup_runs=10,
+    pinned_feed="auto",
+    use_callable="auto",
+):
     print(f"\n=== 执行图推理 ===")
     print(f"输出节点: {output_node_name}")
     print(f"设备: {device.upper()}")
     if device.lower() in ("cuda", "musa"):
         print(f"XLA: {xla}")
 
-    device_name = f"/device:{device.upper()}:0" if device.lower() != "cpu" else "/device:CPU:0"
+    is_musa_xla = device.lower() == "musa" and xla
+    pinned_holders = []
+    active_feed_dict = feed_dict
+    if _mode_enabled(pinned_feed, is_musa_xla):
+        try:
+            active_feed_dict, pinned_holders = prepare_pinned_feed(feed_dict)
+            pinned_bytes = sum(holder.nbytes for holder in pinned_holders)
+            print(
+                f"[MUSA/XLA] pinned feed: ON, "
+                f"{pinned_bytes / (1024 ** 2):.2f} MiB"
+            )
+        except Exception as exc:
+            if pinned_feed == "on":
+                raise
+            print(f"[MUSA/XLA] pinned feed unavailable, fallback: {exc}")
+    else:
+        print("[MUSA/XLA] pinned feed: OFF")
 
     with tf.Graph().as_default() as graph:
         # 测量图导入时间
@@ -668,7 +805,7 @@ def run_inference(graph_def, feed_dict, output_node_name, device="cpu", xla=Fals
         # 准备 Session Feed
         t_feed_start = time.time()
         session_feed_dict = {}
-        for name, data in feed_dict.items():
+        for name, data in active_feed_dict.items():
             try:
                 tensor = graph.get_tensor_by_name(name)
                 session_feed_dict[tensor] = data
@@ -689,6 +826,30 @@ def run_inference(graph_def, feed_dict, output_node_name, device="cpu", xla=Fals
         # 测量 Session 创建时间
         t_sess_start = time.time()
         with tf.compat.v1.Session(graph=graph, config=config) as sess:
+            run_once = None
+            callable_used = False
+            if _mode_enabled(use_callable, is_musa_xla):
+                feed_tensors = list(session_feed_dict.keys())
+                feed_values = [session_feed_dict[tensor] for tensor in feed_tensors]
+                try:
+                    callable_runner = sess.make_callable(
+                        output_tensor, feed_list=feed_tensors
+                    )
+
+                    def run_once():
+                        return callable_runner(*feed_values)
+
+                    callable_used = True
+                except Exception as exc:
+                    if use_callable == "on":
+                        raise
+                    print(f"[MUSA/XLA] make_callable unavailable, fallback: {exc}")
+
+            if run_once is None:
+                def run_once():
+                    return sess.run(output_tensor, feed_dict=session_feed_dict)
+
+            print(f"[MUSA/XLA] Session.make_callable: {'ON' if callable_used else 'OFF'}")
             t_sess_end = time.time()
             print(f"[时间] Session 创建耗时: {(t_sess_end - t_sess_start)*1000:.2f} ms")
 
@@ -696,26 +857,36 @@ def run_inference(graph_def, feed_dict, output_node_name, device="cpu", xla=Fals
                 # 预热运行
                 print(f">>> 预热运行 {warmup_runs} 次...")
                 for _ in range(warmup_runs):
-                    _ = sess.run(output_tensor, feed_dict=session_feed_dict)
+                    result = run_once()
                 print(">>> 预热完成")
 
                 # 正式测量
                 print(f">>> 正式运行 {num_runs} 次...")
                 run_times = []
-                for i in range(num_runs):
-                    t_run_start = time.time()
-                    result = sess.run(output_tensor, feed_dict=session_feed_dict)
-                    t_run_end = time.time()
-                    run_times.append((t_run_end - t_run_start) * 1000)  # ms
+                gc_was_enabled = gc.isenabled()
+                if gc_was_enabled:
+                    gc.disable()
+                try:
+                    for _ in range(num_runs):
+                        t_run_start = time.perf_counter_ns()
+                        result = run_once()
+                        t_run_end = time.perf_counter_ns()
+                        run_times.append((t_run_end - t_run_start) / 1_000_000.0)
+                finally:
+                    if gc_was_enabled:
+                        gc.enable()
 
                 # 性能统计
                 total_time = sum(run_times)
                 avg_time = total_time / num_runs
+                trimmed_avg = _trimmed_mean(run_times)
                 min_time = min(run_times)
                 max_time = max(run_times)
                 p50 = np.percentile(run_times, 50)
+                p90 = np.percentile(run_times, 90)
                 p95 = np.percentile(run_times, 95)
                 p99 = np.percentile(run_times, 99)
+                pattern = _latency_pattern(run_times)
 
                 print("\n" + "="*50)
                 print("[性能统计]")
@@ -726,8 +897,33 @@ def run_inference(graph_def, feed_dict, output_node_name, device="cpu", xla=Fals
                 print(f"  最小:     {min_time:.4f} ms")
                 print(f"  最大:     {max_time:.4f} ms")
                 print(f"  P50:      {p50:.4f} ms")
+                print(f"  P90:      {p90:.4f} ms")
                 print(f"  P95:      {p95:.4f} ms")
                 print(f"  P99:      {p99:.4f} ms")
+                print(f"  Trim10%:  {trimmed_avg:.4f} ms")
+                print(
+                    f"  Odd/Even: {pattern['odd_p50']:.4f}/"
+                    f"{pattern['even_p50']:.4f} ms, ratio={pattern['ratio']:.3f}x"
+                )
+                if pattern["ratio"] >= 1.35:
+                    print(
+                        "  [WARN] Alternating latency is still present; "
+                        "profile PJRT transfer/execute waits."
+                    )
+                perf_summary = {
+                    "average_time_ms": float(avg_time),
+                    "trimmed_avg_ms": float(trimmed_avg),
+                    "min_ms": float(min_time),
+                    "p50_ms": float(p50),
+                    "p90_ms": float(p90),
+                    "p95_ms": float(p95),
+                    "p99_ms": float(p99),
+                    "max_ms": float(max_time),
+                    "alternating_ratio": float(pattern["ratio"]),
+                    "pinned_feed": bool(pinned_holders),
+                    "make_callable": bool(callable_used),
+                }
+                print(f"  PERF_JSON: {json.dumps(perf_summary, sort_keys=True)}")
                 print(f"  吞吐量:   {1000/avg_time:.2f} 次/秒")
                 print("="*50)
 
@@ -797,6 +993,18 @@ def parse_args():
         default=10,
         help="预热运行次数 (默认: 10)"
     )
+    parser.add_argument(
+        "--pinned_feed",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Use MUSA page-locked host feed arrays (auto: MUSA XLA only).",
+    )
+    parser.add_argument(
+        "--use_callable",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Reuse Session.make_callable for the repeated feed/fetch path.",
+    )
     return parser.parse_args()
 
 
@@ -820,6 +1028,21 @@ def main():
 
     total_start = time.time()
     prepare_xla_dump_dir(dump_dir)
+    if args.device.lower() == "musa" and args.xla:
+        print("[MUSA/XLA] latency path:")
+        for env_name in (
+            "MUSA_PJRT_DEBUG_LOG",
+            "MUSA_PJRT_FORCE_HOST_BUFFER_COPY",
+            "MUSA_PJRT_MAX_INFLIGHT_TRANSFERS",
+            "MUSA_PJRT_MAX_INFLIGHT_EXECUTES",
+            "MUSA_PINNED_H2D_ON_COMPUTE_STREAM",
+        ):
+            print(f"  {env_name}={os.environ.get(env_name, '<unset>')}")
+        if not dump_dir and "--xla_dump" in os.environ.get("XLA_FLAGS", ""):
+            print(
+                "[WARN] XLA_FLAGS still enables dumping; do not use this run "
+                "for latency numbers."
+            )
 
     # 仅当 device=musa 时加载 MUSA 插件
     if args.device.lower() == "musa" and args.xla:
@@ -847,7 +1070,9 @@ def main():
         device=args.device,
         xla=args.xla,
         num_runs=args.num_runs,
-        warmup_runs=args.warmup_runs
+        warmup_runs=args.warmup_runs,
+        pinned_feed=args.pinned_feed,
+        use_callable=args.use_callable,
     )
 
     total_end = time.time()

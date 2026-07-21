@@ -41,8 +41,6 @@ namespace gpu {
 //
 // Once all Xla backends will use Xla runtime we will deprecate older API
 // version, and migrate all users to API_VERSION_TYPED_FFI.
-#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA
-
 using xla::runtime::CustomCall;
 using xla::runtime::FlatMemrefView;
 using xla::runtime::StridedMemrefView;
@@ -96,21 +94,21 @@ static absl::Status XlaCustomCallImpl(
   using ApiVersion = CustomCallApiVersion;
 
   auto stream_handle = [&]() {
-#if TENSORFLOW_USE_MUSA
-    return run_options->stream()->platform_specific_handle().stream;
-#else
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
     return se::gpu::AsGpuStreamValue(run_options->stream());
+#else
+    return run_options->stream()->platform_specific_handle().stream;
 #endif
   };
 
   // Original custom call API version that doesn't support returning status.
   if (api_version == ApiVersion::API_VERSION_ORIGINAL) {
-#if TENSORFLOW_USE_MUSA
-    using XlaCustomCallType =
-        void (*)(void*, void**, const char*, size_t);
-#else
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
     using XlaCustomCallType =
         void (*)(se::gpu::GpuStreamHandle, void**, const char*, size_t);
+#else
+    using XlaCustomCallType =
+        void (*)(void*, void**, const char*, size_t);
 #endif
     auto xla_call_target = reinterpret_cast<XlaCustomCallType>(call_target);
 
@@ -135,13 +133,13 @@ static absl::Status XlaCustomCallImpl(
   // Xla Custom call API returning status.
   if (api_version == ApiVersion::API_VERSION_STATUS_RETURNING ||
       api_version == ApiVersion::API_VERSION_STATUS_RETURNING_UNIFIED) {
-#if TENSORFLOW_USE_MUSA
-    using XlaCustomCallType =
-        void (*)(void*, void**, const char*, size_t, XlaCustomCallStatus*);
-#else
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
     using XlaCustomCallType =
         void (*)(se::gpu::GpuStreamHandle, void**, const char*, size_t,
                  XlaCustomCallStatus*);
+#else
+    using XlaCustomCallType =
+        void (*)(void*, void**, const char*, size_t, XlaCustomCallStatus*);
 #endif
     auto xla_call_target = reinterpret_cast<XlaCustomCallType>(call_target);
 
@@ -174,7 +172,7 @@ static absl::Status XlaCustomCallImpl(
 
 XLA_RUNTIME_DEFINE_CUSTOM_CALL(
     XlaCustomCall, FunctionWrapper<XlaCustomCallImpl>(), checks,
-    runtime::CustomCall::Bind("xla.gpu.memcpy")
+    runtime::CustomCall::Bind("xla.gpu.custom_call")
         .UserData<const ServiceExecutableRunOptions*>()
         .UserData<const DebugOptions*>()
         .Arg<CustomCall::RemainingArgs>()  // args
@@ -186,8 +184,6 @@ void RegisterXlaClassicCustomCalls(
     runtime::DirectCustomCallRegistry& registry) {
   registry.Register("xla.gpu.custom_call", XlaCustomCall);
 }
-
-#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA
 
 }  // namespace gpu
 }  // namespace xla

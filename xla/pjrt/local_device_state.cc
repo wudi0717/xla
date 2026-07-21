@@ -224,9 +224,13 @@ std::unique_ptr<se::Stream> LocalDeviceState::BorrowStreamFromPool() {
     usage_stream_pool_.pop();
     auto status = stream->RefreshStatus();  // Can return error::Unimplemented
     // Stream may fail with "ABORTED: Bad connection".
-    if (status.code() != tsl::error::ABORTED) {
-      CHECK(stream->ok()) << status;
+    if (!stream->ok() || status.code() == tsl::error::ABORTED) {
+      LOG(ERROR) << "Dropping failed stream borrowed from pool: " << status;
+      auto replacement = std::make_unique<se::Stream>(compute_stream_->parent());
+      replacement->Init();
+      return replacement;
     }
+    CHECK(status.ok() || status.code() == tsl::error::UNIMPLEMENTED) << status;
     return stream;
   }
 }
@@ -234,9 +238,12 @@ std::unique_ptr<se::Stream> LocalDeviceState::BorrowStreamFromPool() {
 void LocalDeviceState::ReturnStreamToPool(std::unique_ptr<se::Stream> stream) {
   auto status = stream->RefreshStatus();  // Can return error::Unimplemented
   // Stream may fail with "ABORTED: Bad connection".
-  if (status.code() != tsl::error::ABORTED) {
-    CHECK(stream->ok()) << status;
+  if (!stream->ok() || status.code() == tsl::error::ABORTED) {
+    LOG(ERROR) << "Dropping failed stream instead of returning it to pool: "
+               << status;
+    return;
   }
+  CHECK(status.ok() || status.code() == tsl::error::UNIMPLEMENTED) << status;
   absl::MutexLock lock(&mu_);
   usage_stream_pool_.push(std::move(stream));
 }

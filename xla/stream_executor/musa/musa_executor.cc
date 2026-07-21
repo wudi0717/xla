@@ -788,14 +788,14 @@ MusaExecutorStream* AsMusaExecutorStream(Stream* stream) {
   return static_cast<MusaExecutorStream*>(stream->implementation());
 }
 
-MUstream GetMusaStreamHandle(Stream* stream) {
+MUstream GetMusaStreamHandleImpl(Stream* stream) {
   if (auto* musa_stream = dynamic_cast<MusaStream*>(stream)) {
     return musa_stream->stream_handle();
   }
   return AsMusaExecutorStream(stream)->stream_handle();
 }
 
-absl::Mutex* GetMusaStreamSubmitMutex(Stream* stream) {
+absl::Mutex* GetMusaStreamSubmitMutexImpl(Stream* stream) {
   if (auto* musa_stream = dynamic_cast<MusaStream*>(stream)) {
     return musa_stream->submit_mu();
   }
@@ -1023,6 +1023,14 @@ tsl::Status FillBlockDimLimit(MUdevice device, BlockDim* block_dim_limit) {
 
 }  // namespace
 
+MUstream GetMusaStreamHandle(Stream* stream) {
+  return GetMusaStreamHandleImpl(stream);
+}
+
+absl::Mutex* GetMusaStreamSubmitMutex(Stream* stream) {
+  return GetMusaStreamSubmitMutexImpl(stream);
+}
+
 tsl::Status MusaExecutor::Init(int device_ordinal, DeviceOptions device_options) {
   (void)device_options;
   device_ordinal_ = device_ordinal;
@@ -1049,15 +1057,17 @@ DeviceMemoryBase MusaExecutor::Allocate(uint64_t size, int64_t memory_space) {
     return DeviceMemoryBase();
   }
 
-  // Use BFC allocator for better performance with repeated allocations
-  void* ptr = GetBFCAllocator()->Allocate(size);
-  if (!ptr) {
-    LOG(ERROR) << "BFC allocation failed for " << size << " bytes";
+  MUdeviceptr ptr = 0;
+  auto status = musa::ToStatus(muMemAlloc(&ptr, size),
+                               "Failed to allocate MUSA device memory");
+  if (!status.ok()) {
+    LOG(ERROR) << status;
     return DeviceMemoryBase();
   }
 
-  RegisterDeviceMemoryAllocation(ptr, size, context());
-  return DeviceMemoryBase(ptr, size);
+  void* opaque = reinterpret_cast<void*>(ptr);
+  RegisterDeviceMemoryAllocation(opaque, size, context());
+  return DeviceMemoryBase(opaque, size);
 }
 
 void* MusaExecutor::GetSubBuffer(DeviceMemoryBase* parent, uint64_t offset,
@@ -1082,10 +1092,11 @@ void MusaExecutor::Deallocate(DeviceMemoryBase* mem) {
               << " size=" << size << "B device_ordinal=" << device_ordinal_
               << " physical_device_ordinal=" << physical_device_ordinal_;
   }
-  // Prefer BFC fast path; fall back to raw driver free for non-BFC pointers.
-  if (!GetBFCAllocator()->Deallocate(opaque)) {
-    LOG(ERROR) << "MusaBFC: unknown pointer in Deallocate " << opaque
-               << ", skip raw muMemFree to avoid invalid free";
+  auto status = musa::ToStatus(
+      muMemFree(reinterpret_cast<MUdeviceptr>(opaque)),
+      "Failed to free MUSA device memory");
+  if (!status.ok()) {
+    LOG(ERROR) << status;
     return;
   }
   if (IsMusaDebugDeallocEnabled()) {
@@ -1569,6 +1580,19 @@ blas::BlasSupport* MusaExecutor::CreateBlas() {
       registry->GetFactory<PluginRegistry::BlasFactory>(musa::kMusaPlatformId);
   if (!status.ok()) {
     LOG(ERROR) << "Unable to retrieve BLAS factory: "
+               << status.status().message();
+    return nullptr;
+  }
+
+  return status.value()(this);
+}
+
+dnn::DnnSupport* MusaExecutor::CreateDnn() {
+  PluginRegistry* registry = PluginRegistry::Instance();
+  tsl::StatusOr<PluginRegistry::DnnFactory> status =
+      registry->GetFactory<PluginRegistry::DnnFactory>(musa::kMusaPlatformId);
+  if (!status.ok()) {
+    LOG(ERROR) << "Unable to retrieve DNN factory: "
                << status.status().message();
     return nullptr;
   }
@@ -2153,7 +2177,9 @@ tsl::Status MusaExecutor::CreateCustomStream(
     std::optional<std::variant<StreamPriority, int>> priority,
     std::unique_ptr<Stream>* stream) {
   TF_ASSIGN_OR_RETURN(auto custom_stream,
-                      MusaStream::Create(executor, context(), priority));
+                      MusaStream::Create(
+                          executor, context(), priority,
+                          [this](MUstream stream) { UnregisterStream(stream); }));
   auto* musa_stream = static_cast<MusaStream*>(custom_stream.get());
   absl::MutexLock lock(&alive_streams_mu_);
   alive_streams_[musa_stream->stream_handle()] = custom_stream.get();

@@ -111,14 +111,13 @@ void RegisterXlaGpuRuntimeCustomCalls(DirectCustomCallRegistry& registry) {
   RegisterFusedAttentionCustomCalls(registry);
   RegisterFusedAttentionBackwardCustomCalls(registry);
 #endif  // GOOGLE_CUDA
-#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA
   // Graph launch kernels depend on Cuda Graph API.
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA
   RegisterGraphLaunchCustomCalls(registry);
   RegisterConcurrentRegionCustomCalls(registry);
   RegisterStreamSynchronizationCustomCalls(registry);
-
-  RegisterXlaClassicCustomCalls(registry);
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM || TENSORFLOW_USE_MUSA
+  RegisterXlaClassicCustomCalls(registry);
 }
 
 void RegisterXlaGpuTypeIdNames(TypeIDNameRegistry& registry) {

@@ -1,7 +1,11 @@
 #include "xla/stream_executor/musa/musa_blas.h"
 
 #include <array>
+#include <cctype>
 #include <complex>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,6 +24,7 @@
 #include "xla/stream_executor/musa/musa_executor.h"
 #include "xla/stream_executor/musa/musa_platform_id.h"
 #include "xla/stream_executor/platform/initialize.h"
+#include "xla/stream_executor/scratch_allocator.h"
 #include "xla/stream_executor/stream.h"
 #include "xla/stream_executor/temporary_device_memory.h"
 
@@ -144,6 +149,344 @@ bool IsObservedInterleavedB(blas::Transpose transb, uint64_t n, uint64_t k,
                                                  : static_cast<int64_t>(n);
   return batch_count > 1 && stride_b == b_stored_rows &&
          ldb == b_stored_rows * batch_count;
+}
+
+bool IsTruthyEnv(const char* name, bool default_value = false) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || env[0] == '\0') {
+    return default_value;
+  }
+  return std::strcmp(env, "0") != 0 && std::strcmp(env, "false") != 0 &&
+         std::strcmp(env, "False") != 0 && std::strcmp(env, "FALSE") != 0 &&
+         std::strcmp(env, "off") != 0 && std::strcmp(env, "Off") != 0 &&
+         std::strcmp(env, "OFF") != 0;
+}
+
+bool MusaF32FastTf32Requested(blas::DataType dtype) {
+  return dtype == blas::DataType::kFloat &&
+         IsTruthyEnv("MUSA_F32_FAST_TF32");
+}
+
+struct GemmShapeFilter {
+  bool any_m = false;
+  uint64_t m = 0;
+  bool any_n = false;
+  uint64_t n = 0;
+  bool any_k = false;
+  uint64_t k = 0;
+};
+
+std::string TrimAscii(std::string value) {
+  size_t begin = 0;
+  while (begin < value.size() &&
+         std::isspace(static_cast<unsigned char>(value[begin]))) {
+    ++begin;
+  }
+  size_t end = value.size();
+  while (end > begin &&
+         std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+    --end;
+  }
+  return value.substr(begin, end - begin);
+}
+
+bool ParseGemmShapeDim(const std::string& text, bool* any, uint64_t* value) {
+  if (text == "*") {
+    *any = true;
+    *value = 0;
+    return true;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+  if (end == text.c_str() || *end != '\0') {
+    return false;
+  }
+  *any = false;
+  *value = static_cast<uint64_t>(parsed);
+  return true;
+}
+
+bool ParseGemmShapeFilter(std::string token, GemmShapeFilter* filter) {
+  token = TrimAscii(std::move(token));
+  if (token.empty()) {
+    return false;
+  }
+  const size_t first = token.find_first_of("xX");
+  if (first == std::string::npos) {
+    return false;
+  }
+  const size_t second = token.find_first_of("xX", first + 1);
+  if (second == std::string::npos ||
+      token.find_first_of("xX", second + 1) != std::string::npos) {
+    return false;
+  }
+  const std::string m_text = TrimAscii(token.substr(0, first));
+  const std::string n_text =
+      TrimAscii(token.substr(first + 1, second - first - 1));
+  const std::string k_text = TrimAscii(token.substr(second + 1));
+  return ParseGemmShapeDim(m_text, &filter->any_m, &filter->m) &&
+         ParseGemmShapeDim(n_text, &filter->any_n, &filter->n) &&
+         ParseGemmShapeDim(k_text, &filter->any_k, &filter->k);
+}
+
+const std::vector<GemmShapeFilter>& MusaF32FastTf32ShapeFilters() {
+  static const std::vector<GemmShapeFilter>* filters = [] {
+    auto* parsed_filters = new std::vector<GemmShapeFilter>();
+    const char* env = std::getenv("MUSA_F32_FAST_TF32_SHAPES");
+    if (env == nullptr || env[0] == '\0') {
+      return parsed_filters;
+    }
+    std::string shapes(env);
+    size_t start = 0;
+    while (start <= shapes.size()) {
+      const size_t comma = shapes.find(',', start);
+      const size_t end =
+          comma == std::string::npos ? shapes.size() : comma;
+      GemmShapeFilter filter;
+      const std::string token = shapes.substr(start, end - start);
+      if (ParseGemmShapeFilter(token, &filter)) {
+        parsed_filters->push_back(filter);
+      } else if (!TrimAscii(token).empty()) {
+        LOG(WARNING) << "Ignoring invalid MUSA_F32_FAST_TF32_SHAPES token: "
+                     << token;
+      }
+      if (comma == std::string::npos) {
+        break;
+      }
+      start = comma + 1;
+    }
+    return parsed_filters;
+  }();
+  return *filters;
+}
+
+bool GemmShapeFilterMatches(const GemmShapeFilter& filter, uint64_t m,
+                            uint64_t n, uint64_t k) {
+  return (filter.any_m || filter.m == m) && (filter.any_n || filter.n == n) &&
+         (filter.any_k || filter.k == k);
+}
+
+bool MusaF32FastTf32ShapeAllowed(uint64_t m, uint64_t n, uint64_t k) {
+  const std::vector<GemmShapeFilter>& filters = MusaF32FastTf32ShapeFilters();
+  if (filters.empty()) {
+    return true;
+  }
+  for (const GemmShapeFilter& filter : filters) {
+    if (GemmShapeFilterMatches(filter, m, n, k)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool UseMusaF32FastTf32(blas::DataType dtype,
+                        const NumericOptions& numeric_options, uint64_t m,
+                        uint64_t n, uint64_t k) {
+  return MusaF32FastTf32Requested(dtype) && numeric_options.allow_tf32 &&
+         MusaF32FastTf32ShapeAllowed(m, n, k);
+}
+
+enum class StridedBatchedGemmBackend {
+  kAuto,
+  kAutoMublas,
+  kMudnn,
+  kMublas,
+};
+
+enum class GemmBackend {
+  kAuto,
+  kAutoMublas,
+  kMudnn,
+  kMublas,
+  kSmallKMublas,
+};
+
+GemmBackend GetGemmBackend() {
+  const char* env = std::getenv("MUSA_GEMM_BACKEND");
+  if (env == nullptr || env[0] == '\0' || std::strcmp(env, "auto") == 0) {
+    return GemmBackend::kAuto;
+  }
+  if (std::strcmp(env, "auto_mublas") == 0 ||
+      std::strcmp(env, "AUTO_MUBLAS") == 0) {
+    return GemmBackend::kAutoMublas;
+  }
+  if (std::strcmp(env, "mudnn") == 0 || std::strcmp(env, "MUDNN") == 0) {
+    return GemmBackend::kMudnn;
+  }
+  if (std::strcmp(env, "mublas") == 0 || std::strcmp(env, "MUBLAS") == 0) {
+    return GemmBackend::kMublas;
+  }
+  if (std::strcmp(env, "smallk_mublas") == 0 ||
+      std::strcmp(env, "SMALLK_MUBLAS") == 0) {
+    return GemmBackend::kSmallKMublas;
+  }
+  LOG(WARNING) << "Ignoring unknown MUSA_GEMM_BACKEND=" << env;
+  return GemmBackend::kAuto;
+}
+
+const char* GemmBackendName(GemmBackend backend) {
+  switch (backend) {
+    case GemmBackend::kAuto:
+      return "auto";
+    case GemmBackend::kAutoMublas:
+      return "auto_mublas";
+    case GemmBackend::kMudnn:
+      return "mudnn";
+    case GemmBackend::kMublas:
+      return "mublas";
+    case GemmBackend::kSmallKMublas:
+      return "smallk_mublas";
+  }
+  return "unknown";
+}
+
+StridedBatchedGemmBackend GetStridedBatchedGemmBackend() {
+  const char* env = std::getenv("MUSA_STRIDED_BATCHED_GEMM_BACKEND");
+  if (env == nullptr || env[0] == '\0' || std::strcmp(env, "auto") == 0) {
+    return StridedBatchedGemmBackend::kAuto;
+  }
+  if (std::strcmp(env, "auto_mublas") == 0 ||
+      std::strcmp(env, "AUTO_MUBLAS") == 0) {
+    return StridedBatchedGemmBackend::kAutoMublas;
+  }
+  if (std::strcmp(env, "mudnn") == 0 || std::strcmp(env, "MUDNN") == 0) {
+    return StridedBatchedGemmBackend::kMudnn;
+  }
+  if (std::strcmp(env, "mublas") == 0 || std::strcmp(env, "MUBLAS") == 0) {
+    return StridedBatchedGemmBackend::kMublas;
+  }
+  LOG(WARNING) << "Ignoring unknown MUSA_STRIDED_BATCHED_GEMM_BACKEND=" << env;
+  return StridedBatchedGemmBackend::kAuto;
+}
+
+const char* StridedBatchedGemmBackendName(StridedBatchedGemmBackend backend) {
+  switch (backend) {
+    case StridedBatchedGemmBackend::kAuto:
+      return "auto";
+    case StridedBatchedGemmBackend::kAutoMublas:
+      return "auto_mublas";
+    case StridedBatchedGemmBackend::kMudnn:
+      return "mudnn";
+    case StridedBatchedGemmBackend::kMublas:
+      return "mublas";
+  }
+  return "unknown";
+}
+
+bool ShouldLogGemmBackendDecision() {
+  return IsTruthyEnv("MUSA_BLAS_GEMM_DIAGNOSTICS");
+}
+
+bool IsLargeSkinnyFloatGemm(blas::DataType dtype, uint64_t m, uint64_t n,
+                            uint64_t k) {
+  if (dtype != blas::DataType::kFloat) {
+    return false;
+  }
+  const uint64_t major_dim = m > n ? m : n;
+  const uint64_t minor_dim = m > n ? n : m;
+  return major_dim >= 512 && minor_dim <= 64 && k <= 128;
+}
+
+uint64_t ReadUint64Env(const char* name, uint64_t default_value) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || env[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  const unsigned long long parsed = std::strtoull(env, &end, 10);
+  if (end == env || parsed == 0) {
+    LOG(WARNING) << "Ignoring invalid " << name << "=" << env;
+    return default_value;
+  }
+  return static_cast<uint64_t>(parsed);
+}
+
+bool IsSmallKFloatGemm(blas::DataType dtype, uint64_t m, uint64_t n,
+                       uint64_t k) {
+  if (dtype != blas::DataType::kFloat) {
+    return false;
+  }
+  const uint64_t major_dim = m > n ? m : n;
+  const uint64_t minor_dim = m > n ? n : m;
+  static const uint64_t min_major =
+      ReadUint64Env("MUSA_GEMM_SMALLK_MIN_MAJOR", 512);
+  static const uint64_t max_minor =
+      ReadUint64Env("MUSA_GEMM_SMALLK_MAX_MINOR", 512);
+  static const uint64_t max_k =
+      ReadUint64Env("MUSA_GEMM_SMALLK_MAX_K", 32);
+  return major_dim >= min_major && minor_dim <= max_minor && k <= max_k;
+}
+
+bool IsAutoMublasSmallKFloatGemm(blas::DataType dtype, uint64_t m, uint64_t n,
+                                 uint64_t k) {
+  if (dtype != blas::DataType::kFloat) {
+    return false;
+  }
+  const uint64_t major_dim = m > n ? m : n;
+  const uint64_t minor_dim = m > n ? n : m;
+  static const uint64_t min_major =
+      ReadUint64Env("MUSA_GEMM_AUTO_SMALLK_MIN_MAJOR", 1024);
+  static const uint64_t max_minor =
+      ReadUint64Env("MUSA_GEMM_AUTO_SMALLK_MAX_MINOR", 128);
+  static const uint64_t max_k =
+      ReadUint64Env("MUSA_GEMM_AUTO_SMALLK_MAX_K", 16);
+  return major_dim >= min_major && minor_dim <= max_minor && k <= max_k;
+}
+
+bool IsAutoMublasSkinnyFloatGemm(blas::DataType dtype, uint64_t m, uint64_t n,
+                                 uint64_t k) {
+  if (dtype != blas::DataType::kFloat) {
+    return false;
+  }
+  const uint64_t major_dim = m > n ? m : n;
+  const uint64_t minor_dim = m > n ? n : m;
+  static const uint64_t min_major =
+      ReadUint64Env("MUSA_GEMM_AUTO_SKINNY_MIN_MAJOR", 1024);
+  static const uint64_t max_minor =
+      ReadUint64Env("MUSA_GEMM_AUTO_SKINNY_MAX_MINOR", 128);
+  static const uint64_t min_k =
+      ReadUint64Env("MUSA_GEMM_AUTO_SKINNY_MIN_K", 512);
+  static const uint64_t max_k =
+      ReadUint64Env("MUSA_GEMM_AUTO_SKINNY_MAX_K", 4096);
+  return major_dim >= min_major && minor_dim <= max_minor && k >= min_k &&
+         k <= max_k;
+}
+
+bool PreferMublasForStridedBatchedGemm(StridedBatchedGemmBackend backend,
+                                       blas::DataType dtype, uint64_t m,
+                                       uint64_t n, uint64_t k,
+                                       int batch_count,
+                                       bool observed_interleaved_b) {
+  if (backend == StridedBatchedGemmBackend::kMublas) {
+    return true;
+  }
+  if (backend == StridedBatchedGemmBackend::kMudnn) {
+    return false;
+  }
+  if (backend == StridedBatchedGemmBackend::kAutoMublas) {
+    return batch_count > 1 && IsLargeSkinnyFloatGemm(dtype, m, n, k);
+  }
+  return observed_interleaved_b;
+}
+
+bool PreferMublasForGemm(GemmBackend backend, blas::DataType dtype, uint64_t m,
+                         uint64_t n, uint64_t k) {
+  if (backend == GemmBackend::kMublas) {
+    return true;
+  }
+  if (backend == GemmBackend::kMudnn) {
+    return false;
+  }
+  if (backend == GemmBackend::kSmallKMublas) {
+    return IsSmallKFloatGemm(dtype, m, n, k);
+  }
+  if (backend == GemmBackend::kAutoMublas) {
+    return IsLargeSkinnyFloatGemm(dtype, m, n, k) ||
+           IsAutoMublasSmallKFloatGemm(dtype, m, n, k) ||
+           IsAutoMublasSkinnyFloatGemm(dtype, m, n, k);
+  }
+  return IsAutoMublasSmallKFloatGemm(dtype, m, n, k) ||
+         IsAutoMublasSkinnyFloatGemm(dtype, m, n, k);
 }
 
 template <size_t N>
@@ -483,8 +826,8 @@ tsl::Status RunMudnnBatchedGemm(Stream* stream, ::musa::dnn::Handle* handle,
 
   // Observed model case: B has batch dimension interleaved in the middle
   // ([N, B, K] layout with strides [ldb, stride_b, 1]). This is kept here for
-  // diagnostics, but the public entry point skips this known non-contiguous
-  // layout before reaching muDNN.
+  // diagnostics and explicit experiments. The public entry point can skip this
+  // known non-contiguous layout in auto mode unless explicitly enabled.
   const int64_t b_stored_rows =
       (transb == blas::Transpose::kNoTranspose) ? static_cast<int64_t>(k)
                                                  : static_cast<int64_t>(n);
@@ -675,7 +1018,9 @@ tsl::Status MUSABlas::DoBlasGemm(Stream* stream, blas::Transpose transa,
                                  int lda, const DeviceMemoryBase& b, int ldb,
                                  const void* beta, DeviceMemoryBase* c, int ldc,
                                  const NumericOptions& numeric_options) {
-  (void)numeric_options;
+  const bool use_fast_tf32 =
+      UseMusaF32FastTf32(dtype, numeric_options, m, n, k);
+  const bool fast_tf32_shape_allowed = MusaF32FastTf32ShapeAllowed(m, n, k);
 
   auto run_mudnn = [&]() -> tsl::Status {
     absl::MutexLock lock(&mu_);
@@ -685,15 +1030,91 @@ tsl::Status MUSABlas::DoBlasGemm(Stream* stream, blas::Transpose transa,
     if (!SetStream(stream)) {
       return tsl::errors::Internal("Failed to bind muDNN handle to stream");
     }
+    if (MusaF32FastTf32Requested(dtype)) {
+      TF_RETURN_IF_ERROR(ToStatus(dnn_handle_->SetAllowTF32(use_fast_tf32),
+                                  "Handle::SetAllowTF32"));
+    }
     return RunMudnnGemm(dnn_handle_.get(), transa, transb, m, n, k, dtype,
                         alpha, a, lda, b, ldb, beta, c, ldc);
   };
+
+  auto run_mublas = [&]() -> tsl::Status {
+    switch (dtype) {
+      case blas::DataType::kHalf: {
+        Eigen::half alpha_half = Eigen::half(*static_cast<const float*>(alpha));
+        Eigen::half beta_half = Eigen::half(*static_cast<const float*>(beta));
+        return DoBlasInternalStatus(
+            wrap::mublasGemmEx, stream, MUSABlasTranspose(transa),
+            MUSABlasTranspose(transb), static_cast<int>(m), static_cast<int>(n),
+            static_cast<int>(k), &alpha_half, a.opaque(), MUSA_R_16F, lda,
+            b.opaque(), MUSA_R_16F, ldb, &beta_half, c->opaque(), MUSA_R_16F,
+            ldc, MUBLAS_COMPUTE_16F, MUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      }
+      case blas::DataType::kBF16:
+        return DoBlasInternalStatus(
+            wrap::mublasGemmEx, stream, MUSABlasTranspose(transa),
+            MUSABlasTranspose(transb), static_cast<int>(m), static_cast<int>(n),
+            static_cast<int>(k), alpha, a.opaque(), MUSA_R_16BF, lda,
+            b.opaque(), MUSA_R_16BF, ldb, beta, c->opaque(), MUSA_R_16BF, ldc,
+            MUBLAS_COMPUTE_32F, MUBLAS_GEMM_DEFAULT_TENSOR_OP);
+      case blas::DataType::kFloat:
+        if (use_fast_tf32) {
+          return DoBlasInternalStatus(
+              wrap::mublasGemmEx, stream, MUSABlasTranspose(transa),
+              MUSABlasTranspose(transb), static_cast<int>(m),
+              static_cast<int>(n), static_cast<int>(k), alpha, a.opaque(),
+              MUSA_R_32F, lda, b.opaque(), MUSA_R_32F, ldb, beta, c->opaque(),
+              MUSA_R_32F, ldc, MUBLAS_COMPUTE_32F_FAST_TF32,
+              MUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+        return DoBlasInternalStatus(
+            wrap::mublasSgemm, stream, MUSABlasTranspose(transa),
+            MUSABlasTranspose(transb), m, n, k, static_cast<const float*>(alpha),
+            static_cast<const float*>(a.opaque()), lda,
+            static_cast<const float*>(b.opaque()), ldb,
+            static_cast<const float*>(beta), static_cast<float*>(c->opaque()),
+            ldc);
+      case blas::DataType::kDouble:
+        return DoBlasInternalStatus(
+            wrap::mublasDgemm, stream, MUSABlasTranspose(transa),
+            MUSABlasTranspose(transb), m, n, k,
+            static_cast<const double*>(alpha),
+            static_cast<const double*>(a.opaque()), lda,
+            static_cast<const double*>(b.opaque()), ldb,
+            static_cast<const double*>(beta), static_cast<double*>(c->opaque()),
+            ldc);
+      default:
+        return tsl::errors::Unimplemented(
+            absl::StrCat("Unsupported fallback datatype for MUSA GEMM: ",
+                         blas::DataTypeString(dtype)));
+    }
+  };
+
+  const GemmBackend backend = GetGemmBackend();
+  if (ShouldLogGemmBackendDecision()) {
+    LOG(INFO) << "[MUSA_GEMM_BACKEND] kind=gemm backend="
+              << GemmBackendName(backend)
+              << " prefer_mublas="
+              << (PreferMublasForGemm(backend, dtype, m, n, k) ? "true"
+                                                               : "false")
+              << " dtype=" << blas::DataTypeString(dtype) << " m=" << m
+              << " n=" << n << " k=" << k
+              << " fast_tf32=" << (use_fast_tf32 ? "true" : "false")
+              << " fast_tf32_shape_allowed="
+              << (fast_tf32_shape_allowed ? "true" : "false")
+              << " transa=" << TransposeToString(transa)
+              << " transb=" << TransposeToString(transb)
+              << " lda=" << lda << " ldb=" << ldb << " ldc=" << ldc;
+  }
 
   switch (dtype) {
     case blas::DataType::kHalf:
     case blas::DataType::kBF16:
     case blas::DataType::kFloat:
     case blas::DataType::kDouble:
+      if (PreferMublasForGemm(backend, dtype, m, n, k)) {
+        return run_mublas();
+      }
       return run_mudnn();
     case blas::DataType::kComplexFloat: {
       CheckGemmPreconditions(transa, transb, m, n, k, lda, ldb);
@@ -765,7 +1186,9 @@ tsl::Status MUSABlas::DoBlasGemmStridedBatched(
     const DeviceMemoryBase& b, int ldb, int64_t stride_b, const void* beta,
     DeviceMemoryBase* c, int ldc, int64_t stride_c, int batch_count,
     const NumericOptions& numeric_options) {
-  (void)numeric_options;
+  const bool use_fast_tf32 =
+      UseMusaF32FastTf32(dtype, numeric_options, m, n, k);
+  const bool fast_tf32_shape_allowed = MusaF32FastTf32ShapeAllowed(m, n, k);
 
   auto run_mudnn_batched = [&]() -> tsl::Status {
     absl::MutexLock lock(&mu_);
@@ -774,6 +1197,10 @@ tsl::Status MUSABlas::DoBlasGemmStridedBatched(
     TF_RETURN_IF_ERROR(activation.status());
     if (!SetStream(stream)) {
       return tsl::errors::Internal("Failed to bind muDNN handle to stream");
+    }
+    if (MusaF32FastTf32Requested(dtype)) {
+      TF_RETURN_IF_ERROR(ToStatus(dnn_handle_->SetAllowTF32(use_fast_tf32),
+                                  "Handle::SetAllowTF32"));
     }
     return RunMudnnBatchedGemm(stream, dnn_handle_.get(), transa, transb, m, n,
                                k, dtype, alpha, a, lda, stride_a, b, ldb,
@@ -804,6 +1231,18 @@ tsl::Status MUSABlas::DoBlasGemmStridedBatched(
             ldc, static_cast<long long int>(stride_c), batch_count,
             MUBLAS_COMPUTE_32F, MUBLAS_GEMM_DEFAULT_TENSOR_OP);
       case blas::DataType::kFloat:
+        if (use_fast_tf32) {
+          return DoBlasInternalStatus(
+              wrap::mublasGemmStridedBatchedEx, stream,
+              MUSABlasTranspose(transa), MUSABlasTranspose(transb),
+              static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+              alpha, a.opaque(), MUSA_R_32F, lda,
+              static_cast<long long int>(stride_a), b.opaque(), MUSA_R_32F,
+              ldb, static_cast<long long int>(stride_b), beta, c->opaque(),
+              MUSA_R_32F, ldc, static_cast<long long int>(stride_c),
+              batch_count, MUBLAS_COMPUTE_32F_FAST_TF32,
+              MUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
         return DoBlasInternalStatus(
             wrap::mublasSgemmStridedBatched, stream, MUSABlasTranspose(transa),
             MUSABlasTranspose(transb), m, n, k, static_cast<const float*>(alpha),
@@ -832,30 +1271,56 @@ tsl::Status MUSABlas::DoBlasGemmStridedBatched(
     }
   };
 
+  const StridedBatchedGemmBackend backend = GetStridedBatchedGemmBackend();
+  const bool observed_interleaved_b =
+      IsObservedInterleavedB(transb, n, k, ldb, stride_b, batch_count);
+  const bool allow_interleaved_mudnn =
+      IsTruthyEnv("MUSA_MUDNN_INTERLEAVED_BATCH_GEMM");
+  const bool prefer_mublas =
+      PreferMublasForStridedBatchedGemm(backend, dtype, m, n, k, batch_count,
+                                        observed_interleaved_b);
+  const bool try_mudnn =
+      backend == StridedBatchedGemmBackend::kMudnn ||
+      (backend == StridedBatchedGemmBackend::kAuto &&
+       (!observed_interleaved_b || allow_interleaved_mudnn)) ||
+      (backend == StridedBatchedGemmBackend::kAutoMublas && !prefer_mublas);
+  if (ShouldLogGemmBackendDecision()) {
+    LOG(INFO) << "[MUSA_GEMM_BACKEND] kind=strided_batched backend="
+              << StridedBatchedGemmBackendName(backend)
+              << " try_mudnn=" << (try_mudnn ? "true" : "false")
+              << " prefer_mublas=" << (prefer_mublas ? "true" : "false")
+              << " observed_interleaved_b="
+              << (observed_interleaved_b ? "true" : "false")
+              << " allow_interleaved_mudnn="
+              << (allow_interleaved_mudnn ? "true" : "false")
+              << " fast_tf32=" << (use_fast_tf32 ? "true" : "false")
+              << " fast_tf32_shape_allowed="
+              << (fast_tf32_shape_allowed ? "true" : "false")
+              << "; "
+              << BatchedGemmParamsToString(dtype, transa, transb, m, n, k, lda,
+                                           stride_a, ldb, stride_b, ldc,
+                                           stride_c, batch_count);
+  }
+
   switch (dtype) {
     case blas::DataType::kHalf:
     case blas::DataType::kBF16:
     case blas::DataType::kFloat:
     case blas::DataType::kDouble: {
-      const bool observed_interleaved_b =
-          IsObservedInterleavedB(transb, n, k, ldb, stride_b, batch_count);
-      if (observed_interleaved_b) {
-        VLOG(1) << "[OBSERVED_INTERLEAVED_B] skipping muDNN BatchMatMul path "
-                   "for non-contiguous B; using muBLAS strided batched GEMM; "
-                << BatchedGemmParamsToString(dtype, transa, transb, m, n, k,
-                                             lda, stride_a, ldb, stride_b, ldc,
-                                             stride_c, batch_count);
-        return run_mublas_batched();
+      if (try_mudnn) {
+        tsl::Status mudnn_status = run_mudnn_batched();
+        if (mudnn_status.ok()) {
+          return mudnn_status;
+        }
+        if (backend == StridedBatchedGemmBackend::kMudnn) {
+          return mudnn_status;
+        }
+        LOG(INFO) << "Falling back to muBLAS strided batched GEMM: "
+                  << mudnn_status.message() << "; "
+                  << BatchedGemmParamsToString(dtype, transa, transb, m, n, k,
+                                               lda, stride_a, ldb, stride_b,
+                                               ldc, stride_c, batch_count);
       }
-      tsl::Status mudnn_status = run_mudnn_batched();
-      if (mudnn_status.ok()) {
-        return mudnn_status;
-      }
-      LOG(INFO) << "Falling back to muBLAS strided batched GEMM: "
-                << mudnn_status.message() << "; "
-                << BatchedGemmParamsToString(dtype, transa, transb, m, n, k,
-                                             lda, stride_a, ldb, stride_b, ldc,
-                                             stride_c, batch_count);
       return run_mublas_batched();
     }
     case blas::DataType::kComplexFloat: {
@@ -1044,6 +1509,120 @@ tsl::Status MUSABlas::DoBlasGemmStridedBatchedWithAlgorithm(
     return UnsupportedBool<type>("DoBlasGemmBatched");                         \
   }
 
+bool MUSABlas::DoBlasGemmBatched(
+    Stream* stream, blas::Transpose transa, blas::Transpose transb,
+    uint64_t m, uint64 n, uint64 k, float alpha,
+    DeviceMemorySlice<float> a, int lda, DeviceMemorySlice<float> b, int ldb,
+    float beta, DeviceMemorySlice<float> c, int ldc, int batch_count,
+    const NumericOptions& numeric_options,
+    ScratchAllocator* scratch_allocator) {
+  if (batch_count <= 0 || a.size() < batch_count || b.size() < batch_count ||
+      c.size() < batch_count) {
+    LOG(ERROR) << "Invalid F32 batched GEMM pointer array: batch_count="
+               << batch_count << " a=" << a.size() << " b=" << b.size()
+               << " c=" << c.size();
+    return false;
+  }
+
+  std::vector<float*> a_raw_ptrs;
+  std::vector<float*> b_raw_ptrs;
+  std::vector<float*> c_raw_ptrs;
+  a_raw_ptrs.reserve(batch_count);
+  b_raw_ptrs.reserve(batch_count);
+  c_raw_ptrs.reserve(batch_count);
+  for (int i = 0; i < batch_count; ++i) {
+    a_raw_ptrs.push_back(static_cast<float*>(a[i]->opaque()));
+    b_raw_ptrs.push_back(static_cast<float*>(b[i]->opaque()));
+    c_raw_ptrs.push_back(static_cast<float*>(c[i]->opaque()));
+  }
+
+  const size_t pointer_bytes = batch_count * sizeof(float*);
+  DeviceMemory<float*> a_device;
+  DeviceMemory<float*> b_device;
+  DeviceMemory<float*> c_device;
+  std::unique_ptr<TemporaryDeviceMemory<float*>> a_temporary;
+  std::unique_ptr<TemporaryDeviceMemory<float*>> b_temporary;
+  std::unique_ptr<TemporaryDeviceMemory<float*>> c_temporary;
+  if (scratch_allocator != nullptr) {
+    auto a_bytes = scratch_allocator->AllocateBytes(pointer_bytes);
+    auto b_bytes = scratch_allocator->AllocateBytes(pointer_bytes);
+    auto c_bytes = scratch_allocator->AllocateBytes(pointer_bytes);
+    if (!a_bytes.ok() || !b_bytes.ok() || !c_bytes.ok()) {
+      LOG(ERROR) << "Failed to allocate scratch pointer arrays for F32 "
+                    "batched GEMM";
+      return false;
+    }
+    a_device = DeviceMemory<float*>(*a_bytes);
+    b_device = DeviceMemory<float*>(*b_bytes);
+    c_device = DeviceMemory<float*>(*c_bytes);
+  } else {
+    auto a_alloc = stream->AllocateTemporaryArray<float*>(batch_count);
+    auto b_alloc = stream->AllocateTemporaryArray<float*>(batch_count);
+    auto c_alloc = stream->AllocateTemporaryArray<float*>(batch_count);
+    if (!a_alloc.ok() || !b_alloc.ok() || !c_alloc.ok()) {
+      LOG(ERROR) << "Failed to allocate temporary pointer arrays for F32 "
+                    "batched GEMM";
+      return false;
+    }
+    a_temporary = std::move(*a_alloc);
+    b_temporary = std::move(*b_alloc);
+    c_temporary = std::move(*c_alloc);
+    a_device = DeviceMemory<float*>(*a_temporary->mutable_device_memory());
+    b_device = DeviceMemory<float*>(*b_temporary->mutable_device_memory());
+    c_device = DeviceMemory<float*>(*c_temporary->mutable_device_memory());
+  }
+
+  if (!stream->ThenMemcpy(&a_device, a_raw_ptrs.data(), pointer_bytes).ok() ||
+      !stream->ThenMemcpy(&b_device, b_raw_ptrs.data(), pointer_bytes).ok() ||
+      !stream->ThenMemcpy(&c_device, c_raw_ptrs.data(), pointer_bytes).ok()) {
+    LOG(ERROR) << "Failed to copy F32 batched GEMM pointer arrays to device";
+    return false;
+  }
+
+  const bool use_fast_tf32 =
+      UseMusaF32FastTf32(blas::DataType::kFloat, numeric_options, m, n, k);
+  const bool fast_tf32_shape_allowed = MusaF32FastTf32ShapeAllowed(m, n, k);
+  if (ShouldLogGemmBackendDecision()) {
+    LOG(INFO) << "[MUSA_BLAS_GEMM_BATCHED]"
+              << " backend="
+              << (use_fast_tf32 ? "mublasGemmBatchedEx_fast_tf32"
+                                : "mublasSgemmBatched")
+              << " batch_count=" << batch_count << " m=" << m << " n=" << n
+              << " k=" << k << " transa=" << TransposeToString(transa)
+              << " transb=" << TransposeToString(transb) << " lda=" << lda
+              << " ldb=" << ldb << " ldc=" << ldc
+              << " pointer_bytes=" << pointer_bytes
+              << " allow_tf32=" << numeric_options.allow_tf32
+              << " fast_tf32_shape_allowed="
+              << (fast_tf32_shape_allowed ? "true" : "false");
+  }
+  tsl::Status status;
+  if (use_fast_tf32) {
+    status = DoBlasInternalStatus(
+        wrap::mublasGemmBatchedEx, stream, MUSABlasTranspose(transa),
+        MUSABlasTranspose(transb), static_cast<int>(m), static_cast<int>(n),
+        static_cast<int>(k), &alpha,
+        reinterpret_cast<const void* const*>(a_device.opaque()), MUSA_R_32F,
+        lda, reinterpret_cast<const void* const*>(b_device.opaque()),
+        MUSA_R_32F, ldb, &beta,
+        reinterpret_cast<void* const*>(c_device.opaque()), MUSA_R_32F, ldc,
+        batch_count, MUBLAS_COMPUTE_32F_FAST_TF32,
+        MUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  } else {
+    status = DoBlasInternalStatus(
+        wrap::mublasSgemmBatched, stream, MUSABlasTranspose(transa),
+        MUSABlasTranspose(transb), static_cast<int>(m), static_cast<int>(n),
+        static_cast<int>(k), &alpha,
+        reinterpret_cast<const float* const*>(a_device.opaque()), lda,
+        reinterpret_cast<const float* const*>(b_device.opaque()), ldb, &beta,
+        reinterpret_cast<float* const*>(c_device.opaque()), ldc, batch_count);
+  }
+  if (!status.ok()) {
+    LOG(ERROR) << "F32 pointer-array batched GEMM failed: " << status;
+  }
+  return status.ok();
+}
+
 MUSA_BLAS_STUB_AXPY(float)
 MUSA_BLAS_STUB_AXPY(double)
 MUSA_BLAS_STUB_AXPY(std::complex<float>)
@@ -1108,7 +1687,6 @@ bool MUSABlas::DoBlasSbmv(Stream* stream, blas::UpperLower uplo, uint64_t n,
 
 MUSA_BLAS_STUB_GEMM_BATCHED(Eigen::half, float)
 MUSA_BLAS_STUB_GEMM_BATCHED(Eigen::bfloat16, float)
-MUSA_BLAS_STUB_GEMM_BATCHED(float, float)
 MUSA_BLAS_STUB_GEMM_BATCHED(double, double)
 MUSA_BLAS_STUB_GEMM_BATCHED(std::complex<float>, std::complex<float>)
 MUSA_BLAS_STUB_GEMM_BATCHED(std::complex<double>, std::complex<double>)

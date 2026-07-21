@@ -246,6 +246,67 @@ TEST_F(FusionMergerTest, WillMergeIntoInputFusion) {
               GmockMatch(m::Fusion(m::Parameter())));
 }
 
+TEST_F(FusionMergerTest,
+       MaterializesLargeMultiUserProducerWithReductionUserWhenEnabled) {
+  auto module = ParseAndReturnVerifiedModule(R"(
+    HloModule m
+
+    add_reducer {
+      lhs = f32[] parameter(0)
+      rhs = f32[] parameter(1)
+      ROOT add = f32[] add(lhs, rhs)
+    }
+
+    producer_computation {
+      lhs = f32[2,4,8]{2,1,0} parameter(0)
+      rhs = f32[2,4,8]{2,1,0} parameter(1)
+      ROOT add = f32[2,4,8]{2,1,0} add(lhs, rhs)
+    }
+
+    sum_computation {
+      input = f32[2,4,8]{2,1,0} parameter(0)
+      init = f32[] constant(0)
+      ROOT reduce = f32[2,4]{1,0} reduce(input, init), dimensions={2},
+          to_apply=add_reducer
+    }
+
+    loop_computation {
+      input = f32[2,4,8]{2,1,0} parameter(0)
+      ROOT negate = f32[2,4,8]{2,1,0} negate(input)
+    }
+
+    ENTRY entry {
+      lhs = f32[2,4,8]{2,1,0} parameter(0)
+      rhs = f32[2,4,8]{2,1,0} parameter(1)
+      producer = f32[2,4,8]{2,1,0} fusion(lhs, rhs), kind=kLoop,
+          calls=producer_computation
+      sum = f32[2,4]{1,0} fusion(producer), kind=kInput,
+          calls=sum_computation
+      loop = f32[2,4,8]{2,1,0} fusion(producer), kind=kLoop,
+          calls=loop_computation
+      ROOT tuple = (f32[2,4]{1,0}, f32[2,4,8]{2,1,0}) tuple(sum, loop)
+    })")
+                    .value();
+
+  FusionMergerOptions options;
+  options.materialize_large_multi_user_reduction_producer = true;
+  options.min_materialized_producer_elements = 1;
+  options.min_materialized_producer_operands = 2;
+  FusionMerger fusion_merger(TestGpuDeviceInfo::RTXA6000DeviceInfo(),
+                             ShapeSizeBytesFunction(), options);
+
+  EXPECT_FALSE(fusion_merger.Run(module.get()).value());
+  auto* root = module->entry_computation()->root_instruction();
+  ASSERT_EQ(root->operand(0)->opcode(), HloOpcode::kFusion);
+  ASSERT_EQ(root->operand(1)->opcode(), HloOpcode::kFusion);
+  EXPECT_EQ(root->operand(0)->operand(0), root->operand(1)->operand(0));
+  EXPECT_EQ(root->operand(0)->operand(0)->name(), "producer");
+
+  auto default_module =
+      ParseAndReturnVerifiedModule(module->ToString()).value();
+  EXPECT_TRUE(fusion_merger_.Run(default_module.get()).value());
+}
+
 TEST_F(FusionMergerTest, WillMergeIntoUnfusedConsumer) {
   auto module = ParseAndReturnVerifiedModule(R"(
     HloModule jit_matmul.36

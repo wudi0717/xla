@@ -16,25 +16,91 @@ limitations under the License.
 #include "xla/service/gpu/horizontal_loop_fusion.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <utility>
 #include <vector>
 
+#include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/types/span.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
+#include "xla/hlo/ir/hlo_reachability.h"
 #include "xla/layout_util.h"
 #include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/hlo_creation_utils.h"
 #include "xla/xla_data.pb.h"
 #include "tsl/platform/errors.h"
+#include "tsl/platform/logging.h"
 
 namespace xla {
 namespace gpu {
 
 namespace {
+
+bool MusaHorizontalFusionDiagnosticsEnabled() {
+  const char* value =
+      std::getenv("MUSA_XLA_HORIZONTAL_FUSION_DIAGNOSTICS");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool MusaCrossConsumerHorizontalFusionEnabled() {
+  const char* value =
+      std::getenv("MUSA_XLA_CROSS_CONSUMER_HORIZONTAL_FUSION");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+int64_t ReadPositiveInt64Env(const char* name, int64_t default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0) {
+    return default_value;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+struct MusaHorizontalFusionDiagnostics {
+  int64_t consumers = 0;
+  int64_t candidate_scans = 0;
+  int64_t operand_candidates = 0;
+  int64_t fusible_candidates = 0;
+  int64_t accepted_candidates = 0;
+  int64_t rejected_control = 0;
+  int64_t rejected_variadic_reduction = 0;
+  int64_t rejected_not_loop_or_elementwise = 0;
+  int64_t rejected_mixed_output_types = 0;
+  int64_t rejected_not_only_user = 0;
+  int64_t rejected_not_profitable = 0;
+  int64_t rejected_non_row_major = 0;
+  int64_t rejected_shared_parameter = 0;
+  int64_t spans = 0;
+  int64_t singleton_spans = 0;
+  int64_t break_output_type = 0;
+  int64_t break_output_count = 0;
+  int64_t break_instruction_count = 0;
+  int64_t break_output_shape = 0;
+  int64_t break_batch_limit = 0;
+  int64_t break_parameter_budget = 0;
+  int64_t fusion_groups = 0;
+  int64_t fused_instructions = 0;
+  int64_t cross_consumer_candidates = 0;
+  int64_t cross_consumer_groups = 0;
+  int64_t cross_consumer_fused_instructions = 0;
+  int64_t cross_consumer_launch_reduction = 0;
+  int64_t cross_consumer_dependency_filtered = 0;
+  int64_t cross_consumer_compatibility_filtered = 0;
+  int64_t cross_consumer_distance_filtered = 0;
+  int64_t cross_consumer_multi_user_filtered = 0;
+  int64_t cross_consumer_profitability_filtered = 0;
+  int64_t cross_consumer_parameter_filtered = 0;
+};
 
 PrimitiveType GetUniqueOutputTypeOfFusible(const HloInstruction& fusible) {
   auto outputs = GetOutputsOfFusible(fusible);
@@ -54,8 +120,11 @@ PrimitiveType GetUniqueOutputTypeOfFusible(const HloInstruction& fusible) {
 class HorizontalLoopFusionImpl {
  public:
   explicit HorizontalLoopFusionImpl(HloComputation* computation,
-                                    absl::string_view prefix)
-      : computation_(computation), prefix_(prefix) {}
+                                    absl::string_view prefix,
+                                    MusaHorizontalFusionDiagnostics* diagnostics)
+      : computation_(computation),
+        prefix_(prefix),
+        diagnostics_(diagnostics) {}
 
   ~HorizontalLoopFusionImpl() = default;
 
@@ -93,16 +162,20 @@ class HorizontalLoopFusionImpl {
       HloInstruction* consumer, bool sliced_input_fusion,
       std::vector<HloInstruction*>& to_fuse_candidates);
 
+  StatusOr<bool> FuseCrossConsumerLoopFusions();
+
   // FusionCandidates collects profitable candidates for a given consumer
   // instruction. GetNextSpanOfFusions() can then be iteratively invoked to
   // acquire the next set of fusion candidates based on some heuristics.
   class FusionCandidates {
    public:
     explicit FusionCandidates(HloInstruction* consumer,
-                              bool sliced_input_fusion)
+                              bool sliced_input_fusion,
+                              MusaHorizontalFusionDiagnostics* diagnostics)
         : fusible_instrs_(),
           pos_(0),
-          sliced_input_fusion_(sliced_input_fusion) {
+          sliced_input_fusion_(sliced_input_fusion),
+          diagnostics_(diagnostics) {
       Initialize(consumer);
     }
 
@@ -118,20 +191,29 @@ class HorizontalLoopFusionImpl {
     // `sliced_input_fusion_` flag controls whether we want to fuse
     // into kLoop (false) or kInput (True) type kernel
     bool sliced_input_fusion_;
+    MusaHorizontalFusionDiagnostics* diagnostics_;
   };
 
   HloComputation* computation_;
   std::string prefix_;
+  MusaHorizontalFusionDiagnostics* diagnostics_;
 };  // HorizontalLoopFusionImpl
 
-bool IsFusibleCandidate(const HloInstruction& instr) {
+bool IsFusibleCandidate(const HloInstruction& instr,
+                        MusaHorizontalFusionDiagnostics* diagnostics) {
   // For now, we do not support fusing instruction with control flow.
   if (!instr.control_successors().empty() ||
       !instr.control_predecessors().empty()) {
+    if (diagnostics != nullptr) {
+      ++diagnostics->rejected_control;
+    }
     return false;
   }
 
   if (IsNestableVariadicReduction(instr)) {
+    if (diagnostics != nullptr) {
+      ++diagnostics->rejected_variadic_reduction;
+    }
     return false;
   }
 
@@ -142,6 +224,9 @@ bool IsFusibleCandidate(const HloInstruction& instr) {
 
   // Exclude fusions other than kLoop.
   if (!instr.IsLoopFusion()) {
+    if (diagnostics != nullptr) {
+      ++diagnostics->rejected_not_loop_or_elementwise;
+    }
     return false;
   }
 
@@ -154,6 +239,9 @@ bool IsFusibleCandidate(const HloInstruction& instr) {
   for (size_t i = 1; i < outputs.size(); ++i) {
     if (first_output->shape().element_type() !=
         outputs[i]->shape().element_type()) {
+      if (diagnostics != nullptr) {
+        ++diagnostics->rejected_mixed_output_types;
+      }
       return false;
     }
   }
@@ -253,12 +341,22 @@ void HorizontalLoopFusionImpl::FusionCandidates::Initialize(
   // First, find out all potential target candidates. We will filter out
   // unsupported/non-profitable cases below.
   absl::flat_hash_set<HloInstruction*> fusible_candidates;
+  absl::flat_hash_set<HloInstruction*> seen_predecessors;
   std::vector<HloInstruction*> ordered_fusible_candidates;
   for (HloInstruction* opnd : consumer->operands()) {
     HloInstruction* predecessor = opnd->LatestNonGteAncestor();
+    if (!seen_predecessors.insert(predecessor).second) {
+      continue;
+    }
+    if (diagnostics_ != nullptr) {
+      ++diagnostics_->operand_candidates;
+    }
     // We support kLoop fusion and element-wise HLOs now. We may extend the
     // support list if needs arise.
-    if (IsFusibleCandidate(*predecessor)) {
+    if (IsFusibleCandidate(*predecessor, diagnostics_)) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->fusible_candidates;
+      }
       if (fusible_candidates.insert(predecessor).second) {
         // Add unseen fusion to ordered list.
         ordered_fusible_candidates.push_back(predecessor);
@@ -268,20 +366,32 @@ void HorizontalLoopFusionImpl::FusionCandidates::Initialize(
 
   for (HloInstruction* instr : ordered_fusible_candidates) {
     if (!IsConsumerTheOnlyNonRootUser(*instr, *consumer)) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->rejected_not_only_user;
+      }
       VLOG(2) << "sliced_input_fusion=" << sliced_input_fusion_
               << " rejects maybe illegal instr " << instr->ToString()
               << "; including it may create cycles in HLO.";
       continue;
     } else if (!IsProfitableFusionCandidate(*instr, sliced_input_fusion_)) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->rejected_not_profitable;
+      }
       VLOG(2) << "sliced_input_fusion=" << sliced_input_fusion_
               << " rejects may-not-be profitable fusion instr"
               << instr->ToString();
       continue;
     } else if (!HasOnlyRowMajorLayout(*instr)) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->rejected_non_row_major;
+      }
       VLOG(2) << "sliced_input_fusion=" << sliced_input_fusion_
               << " rejects non-row-major fusion instr " << instr->ToString();
       continue;
     } else if (AnyOpndIsParamSharedAmongFusions(instr, fusible_candidates)) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->rejected_shared_parameter;
+      }
       // Don't fuse fusions whose operands are parameter instructions that are
       // shared among fusions because we cannot i/o alias the produced
       // horizontal fusion due to the concat insertion.
@@ -290,6 +400,9 @@ void HorizontalLoopFusionImpl::FusionCandidates::Initialize(
               << " other fusion candidates, instr: " << instr->ToString();
       continue;
     } else {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->accepted_candidates;
+      }
       VLOG(2) << "Find a fusion candidate " << instr->ToString();
       // Encapsulate it into a fusion computation for unified representation
       // for later processing.
@@ -363,20 +476,6 @@ HorizontalLoopFusionImpl::FusionCandidates::GetNextSpanOfFusions() {
   // CUDA has a parameter size limit of ~4k bytes.
   constexpr int64_t kMaxCudaParamSize = 4000;
   size_t accum_io_size = 0;
-  auto reach_max_fusion_batch_size = [&](size_t left, size_t right) -> bool {
-    if (right - left >= kMaxFusionBatchSize) {
-      return true;
-    }
-
-    accum_io_size += fusible_instrs_.at(right)->operand_count() +
-                     GetOutputSizeOfFusible(*fusible_instrs_.at(right));
-
-    if (accum_io_size * 8 >= kMaxCudaParamSize) {
-      return true;
-    }
-
-    return false;
-  };
 
   size_t left = pos_;
   size_t right = pos_ + 1;
@@ -387,14 +486,23 @@ HorizontalLoopFusionImpl::FusionCandidates::GetNextSpanOfFusions() {
     PrimitiveType cur_output_type =
         GetUniqueOutputTypeOfFusible(*fusible_instrs_[right]);
     if (first_output_type != cur_output_type) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->break_output_type;
+      }
       // Cannot fuse computations who have multiple output types.
       break;
     } else if (first_output_size !=
                GetOutputSizeOfFusible(*fusible_instrs_[right])) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->break_output_count;
+      }
       // Cannot fuse computations who have different numbers of outputs.
       break;
     } else if (GetInstrCountOfFusible(*fusible_instrs_[left]) !=
                GetInstrCountOfFusible(*fusible_instrs_[right])) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->break_instruction_count;
+      }
       // Do not fuse computations of different instruction counts as it may
       // introduce control divergence. This is a very simple heuristic to avoid
       // fusing computations with too much discrepancy and we may improve it
@@ -404,13 +512,31 @@ HorizontalLoopFusionImpl::FusionCandidates::GetNextSpanOfFusions() {
                !ShapeUtil::EqualIgnoringElementType(
                    GetOutputsOfFusible(*fusible_instrs_[left])[0]->shape(),
                    GetOutputsOfFusible(*fusible_instrs_[right])[0]->shape())) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->break_output_shape;
+      }
       // This is for fusing into kLoop type kernel, so we requires that each
       // fusion operand have the same shape
       break;
-    } else if (reach_max_fusion_batch_size(left, right)) {
+    } else if (right - left >= kMaxFusionBatchSize) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->break_batch_limit;
+      }
       // Hit max fusion batch size.
       break;
+    } else {
+      accum_io_size += fusible_instrs_.at(right)->operand_count() +
+                       GetOutputSizeOfFusible(*fusible_instrs_.at(right));
+      if (accum_io_size * 8 >= kMaxCudaParamSize) {
+        if (diagnostics_ != nullptr) {
+          ++diagnostics_->break_parameter_budget;
+        }
+        break;
+      }
     }
+  }
+  if (diagnostics_ != nullptr) {
+    ++diagnostics_->spans;
   }
   VLOG(2) << "horizontal fuse get instruction span with " << (right - left)
           << " instructions for sliced_input_fusion=" << sliced_input_fusion_
@@ -423,12 +549,19 @@ StatusOr<bool> HorizontalLoopFusionImpl::FuseConsumerOperands(
     HloInstruction* consumer, bool sliced_input_fusion,
     std::vector<HloInstruction*>& to_fuse_candidates) {
   bool changed = false;
-  FusionCandidates loop_fusion_candidates(consumer, sliced_input_fusion);
+  if (diagnostics_ != nullptr) {
+    ++diagnostics_->candidate_scans;
+  }
+  FusionCandidates loop_fusion_candidates(consumer, sliced_input_fusion,
+                                           diagnostics_);
   while (true) {
     auto fusibles = loop_fusion_candidates.GetNextSpanOfFusions();
     if (fusibles.empty()) {
       break;
     } else if (fusibles.size() == 1) {
+      if (diagnostics_ != nullptr) {
+        ++diagnostics_->singleton_spans;
+      }
       // Skip; there is just one fused_instr.
       continue;
     }
@@ -450,6 +583,152 @@ StatusOr<bool> HorizontalLoopFusionImpl::FuseConsumerOperands(
 
     TF_RETURN_IF_ERROR(Fuse(absl::MakeSpan(fusion_instrs), sliced_input_fusion,
                             to_fuse_candidates));
+    if (diagnostics_ != nullptr) {
+      ++diagnostics_->fusion_groups;
+      diagnostics_->fused_instructions += fusion_instrs.size();
+    }
+  }
+  return changed;
+}
+
+StatusOr<bool> HorizontalLoopFusionImpl::FuseCrossConsumerLoopFusions() {
+  struct Candidate {
+    HloInstruction* instruction;
+    size_t postorder_index;
+  };
+
+  const size_t max_group_size = static_cast<size_t>(ReadPositiveInt64Env(
+      "MUSA_XLA_CROSS_CONSUMER_HORIZONTAL_FUSION_MAX_GROUP_SIZE", 4));
+  const size_t max_postorder_distance =
+      static_cast<size_t>(ReadPositiveInt64Env(
+          "MUSA_XLA_CROSS_CONSUMER_HORIZONTAL_FUSION_MAX_POSTORDER_DISTANCE",
+          64));
+
+  std::vector<HloInstruction*> postorder =
+      computation_->MakeInstructionPostOrder();
+  std::vector<Candidate> candidates;
+  candidates.reserve(postorder.size());
+  for (size_t index = 0; index < postorder.size(); ++index) {
+    HloInstruction* instr = postorder[index];
+    if (instr->opcode() != HloOpcode::kFusion || !instr->IsLoopFusion() ||
+        instr->IsDead()) {
+      continue;
+    }
+    if (GetOutputSizeOfFusible(*instr) != 1 ||
+        !instr->control_successors().empty() ||
+        !instr->control_predecessors().empty() ||
+        !HasOnlyRowMajorLayout(*instr)) {
+      ++diagnostics_->cross_consumer_compatibility_filtered;
+      continue;
+    }
+    if (instr->user_count() != 1) {
+      ++diagnostics_->cross_consumer_multi_user_filtered;
+      continue;
+    }
+    if (!IsProfitableFusionCandidate(*instr, /*sliced_input_fusion=*/false)) {
+      ++diagnostics_->cross_consumer_profitability_filtered;
+      continue;
+    }
+    candidates.push_back({instr, index});
+  }
+  diagnostics_->cross_consumer_candidates =
+      static_cast<int64_t>(candidates.size());
+  if (candidates.size() < 2) {
+    return false;
+  }
+
+  std::unique_ptr<HloReachabilityMap> reachability =
+      HloReachabilityMap::Build(computation_);
+  absl::flat_hash_set<HloInstruction*> consumed;
+  std::vector<std::vector<HloInstruction*>> groups;
+
+  auto compatible = [](const HloInstruction* lhs,
+                       const HloInstruction* rhs) {
+    return GetInstrCountOfFusible(*lhs) == GetInstrCountOfFusible(*rhs) &&
+           ShapeUtil::Equal(lhs->shape(), rhs->shape());
+  };
+  auto shares_parameter = [](const HloInstruction* instr,
+                             absl::Span<HloInstruction* const> selected) {
+    for (const HloInstruction* operand : instr->operands()) {
+      if (operand->opcode() != HloOpcode::kParameter) {
+        continue;
+      }
+      for (const HloInstruction* selected_instr : selected) {
+        if (absl::c_linear_search(selected_instr->operands(), operand)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  constexpr int64_t kMaxParameterBytes = 4000;
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    HloInstruction* seed = candidates[i].instruction;
+    if (consumed.contains(seed)) {
+      continue;
+    }
+    std::vector<HloInstruction*> group = {seed};
+    int64_t parameter_entries = seed->operand_count() + 1;
+    for (size_t j = i + 1;
+         j < candidates.size() && group.size() < max_group_size; ++j) {
+      HloInstruction* candidate = candidates[j].instruction;
+      if (consumed.contains(candidate)) {
+        continue;
+      }
+      if (candidates[j].postorder_index - candidates[i].postorder_index >
+          max_postorder_distance) {
+        diagnostics_->cross_consumer_distance_filtered +=
+            static_cast<int64_t>(candidates.size() - j);
+        break;
+      }
+      if (!compatible(seed, candidate) ||
+          shares_parameter(candidate, absl::MakeConstSpan(group))) {
+        ++diagnostics_->cross_consumer_compatibility_filtered;
+        continue;
+      }
+      bool connected = false;
+      for (HloInstruction* selected : group) {
+        if (reachability->IsConnected(selected, candidate)) {
+          connected = true;
+          break;
+        }
+      }
+      if (connected) {
+        ++diagnostics_->cross_consumer_dependency_filtered;
+        continue;
+      }
+      const int64_t candidate_parameter_entries =
+          candidate->operand_count() + 1;
+      if ((parameter_entries + candidate_parameter_entries) * 8 >=
+          kMaxParameterBytes) {
+        ++diagnostics_->cross_consumer_parameter_filtered;
+        continue;
+      }
+      parameter_entries += candidate_parameter_entries;
+      group.push_back(candidate);
+    }
+    if (group.size() < 2) {
+      continue;
+    }
+    for (HloInstruction* instr : group) {
+      consumed.insert(instr);
+    }
+    groups.push_back(std::move(group));
+  }
+
+  bool changed = false;
+  std::vector<HloInstruction*> ignored_candidates;
+  for (std::vector<HloInstruction*>& group : groups) {
+    TF_RETURN_IF_ERROR(Fuse(absl::MakeSpan(group),
+                            /*sliced_input_fusion=*/false,
+                            ignored_candidates));
+    changed = true;
+    ++diagnostics_->cross_consumer_groups;
+    diagnostics_->cross_consumer_fused_instructions +=
+        static_cast<int64_t>(group.size());
+    diagnostics_->cross_consumer_launch_reduction +=
+        static_cast<int64_t>(group.size() - 1);
   }
   return changed;
 }
@@ -693,6 +972,9 @@ StatusOr<bool> HorizontalLoopFusionImpl::Run() {
     if (consumer->IsDead()) {
       continue;
     }
+    if (diagnostics_ != nullptr) {
+      ++diagnostics_->consumers;
+    }
 
     // we first try to fuse into kLoop fusion instruction for those operands
     // that have the same shape.
@@ -708,6 +990,11 @@ StatusOr<bool> HorizontalLoopFusionImpl::Run() {
 
     changed = changed || loop_fusion_changed || sliced_input_fusion_changed;
   }
+  if (MusaCrossConsumerHorizontalFusionEnabled()) {
+    TF_ASSIGN_OR_RETURN(bool cross_consumer_changed,
+                        FuseCrossConsumerLoopFusions());
+    changed = changed || cross_consumer_changed;
+  }
   return changed;
 }
 
@@ -715,8 +1002,85 @@ StatusOr<bool> HorizontalLoopFusionImpl::Run() {
 
 StatusOr<bool> GpuHorizontalLoopFusion::RunOnComputation(
     HloComputation* computation) {
-  HorizontalLoopFusionImpl horizontal_fusion_impl(computation, prefix_);
-  return horizontal_fusion_impl.Run();
+  const bool diagnostics_enabled = MusaHorizontalFusionDiagnosticsEnabled();
+  const bool cross_consumer_enabled =
+      MusaCrossConsumerHorizontalFusionEnabled();
+  MusaHorizontalFusionDiagnostics diagnostics;
+  HorizontalLoopFusionImpl horizontal_fusion_impl(
+      computation, prefix_,
+      diagnostics_enabled || cross_consumer_enabled ? &diagnostics : nullptr);
+  TF_ASSIGN_OR_RETURN(bool changed, horizontal_fusion_impl.Run());
+  if (diagnostics_enabled) {
+    LOG(INFO) << "[MUSA_HORIZONTAL_FUSION_DIAGNOSTICS] module="
+              << computation->parent()->name() << " computation="
+              << computation->name() << " changed=" << changed
+              << " consumers=" << diagnostics.consumers
+              << " candidate_scans=" << diagnostics.candidate_scans
+              << " operand_candidates=" << diagnostics.operand_candidates
+              << " fusible_candidates=" << diagnostics.fusible_candidates
+              << " accepted_candidates=" << diagnostics.accepted_candidates
+              << " rejected_control=" << diagnostics.rejected_control
+              << " rejected_variadic_reduction="
+              << diagnostics.rejected_variadic_reduction
+              << " rejected_not_loop_or_elementwise="
+              << diagnostics.rejected_not_loop_or_elementwise
+              << " rejected_mixed_output_types="
+              << diagnostics.rejected_mixed_output_types
+              << " rejected_not_only_user="
+              << diagnostics.rejected_not_only_user
+              << " rejected_not_profitable="
+              << diagnostics.rejected_not_profitable
+              << " rejected_non_row_major="
+              << diagnostics.rejected_non_row_major
+              << " rejected_shared_parameter="
+              << diagnostics.rejected_shared_parameter
+              << " spans=" << diagnostics.spans
+              << " singleton_spans=" << diagnostics.singleton_spans
+              << " break_output_type=" << diagnostics.break_output_type
+              << " break_output_count=" << diagnostics.break_output_count
+              << " break_instruction_count="
+              << diagnostics.break_instruction_count
+              << " break_output_shape=" << diagnostics.break_output_shape
+              << " break_batch_limit=" << diagnostics.break_batch_limit
+              << " break_parameter_budget="
+              << diagnostics.break_parameter_budget
+              << " fusion_groups=" << diagnostics.fusion_groups
+              << " fused_instructions=" << diagnostics.fused_instructions;
+  }
+  if (cross_consumer_enabled) {
+    LOG(INFO) << "[MUSA_CROSS_CONSUMER_HORIZONTAL_FUSION] module="
+              << computation->parent()->name() << " computation="
+              << computation->name() << " changed=" << changed
+              << " max_group_size="
+              << ReadPositiveInt64Env(
+                     "MUSA_XLA_CROSS_CONSUMER_HORIZONTAL_FUSION_MAX_GROUP_SIZE",
+                     4)
+              << " max_postorder_distance="
+              << ReadPositiveInt64Env(
+                     "MUSA_XLA_CROSS_CONSUMER_HORIZONTAL_FUSION_MAX_POSTORDER_DISTANCE",
+                     64)
+              << " cross_consumer_candidates="
+              << diagnostics.cross_consumer_candidates
+              << " cross_consumer_groups="
+              << diagnostics.cross_consumer_groups
+              << " cross_consumer_fused_instructions="
+              << diagnostics.cross_consumer_fused_instructions
+              << " cross_consumer_launch_reduction="
+              << diagnostics.cross_consumer_launch_reduction
+              << " cross_consumer_dependency_filtered="
+              << diagnostics.cross_consumer_dependency_filtered
+              << " cross_consumer_compatibility_filtered="
+              << diagnostics.cross_consumer_compatibility_filtered
+              << " cross_consumer_distance_filtered="
+              << diagnostics.cross_consumer_distance_filtered
+              << " cross_consumer_multi_user_filtered="
+              << diagnostics.cross_consumer_multi_user_filtered
+              << " cross_consumer_profitability_filtered="
+              << diagnostics.cross_consumer_profitability_filtered
+              << " cross_consumer_parameter_filtered="
+              << diagnostics.cross_consumer_parameter_filtered;
+  }
+  return changed;
 }
 
 StatusOr<bool> GpuHorizontalLoopFusion::Run(

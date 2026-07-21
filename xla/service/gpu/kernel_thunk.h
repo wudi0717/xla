@@ -75,6 +75,9 @@ class KernelThunk : public Thunk {
   const std::vector<BufferAllocation::Slice>& arguments() const {
     return args_;
   }
+  absl::Span<const BufferAllocation::Slice> buffer_arguments() const override {
+    return args_;
+  }
   const std::vector<bool>& written() const { return written_; }
 
   const std::string& kernel_name() const { return kernel_name_; }

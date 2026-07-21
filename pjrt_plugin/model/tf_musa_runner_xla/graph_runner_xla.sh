@@ -31,7 +31,8 @@ Options:
   --no-xla                  Disable XLA
   --xla-dump                Enable HLO dump
   --xla-dump-dir DIR        Override HLO dump directory
-  --musa-plugin PATH        Path to libmusa_pjrt_plugin_zy.so
+  --musa-plugin PATH        Path to the MUSA PJRT core plugin
+  --musa-tf-adapter PATH    Path to the TensorFlow NPD adapter
   --average                 Print repeat average. Default: enabled
   --no-average              Disable repeat average output
 EOF
@@ -53,6 +54,7 @@ XLA_ENABLED="1"
 XLA_DUMP="0"
 XLA_DUMP_DIR=""
 MUSA_PLUGIN=""
+MUSA_TF_ADAPTER=""
 AVERAGE_ENABLED="1"
 
 while [[ $# -gt 0 ]]; do
@@ -129,6 +131,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --musa-plugin)
       MUSA_PLUGIN="${2:-}"
+      shift 2
+      ;;
+    --musa-tf-adapter)
+      MUSA_TF_ADAPTER="${2:-}"
       shift 2
       ;;
     --average|--averge)
@@ -255,6 +261,9 @@ for bs in "${BATCH_SIZES[@]}"; do
     fi
     if [[ -n "$MUSA_PLUGIN" ]]; then
       runner_args+=(--musa_plugin "$MUSA_PLUGIN")
+    fi
+    if [[ -n "$MUSA_TF_ADAPTER" ]]; then
+      runner_args+=(--musa_tf_adapter "$MUSA_TF_ADAPTER")
     fi
 
     if (

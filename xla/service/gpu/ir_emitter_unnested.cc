@@ -34,6 +34,7 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
@@ -45,6 +46,7 @@ limitations under the License.
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -109,6 +111,13 @@ limitations under the License.
 #include "xla/service/gpu/kernel_thunk.h"
 #include "xla/service/gpu/launch_dimensions.h"
 #include "xla/service/gpu/matmul_utils.h"
+#include "xla/service/gpu/musa_fusion_custom_calls.h"
+#include "xla/service/gpu/musa_gemm_beta_chain_thunk.h"
+#include "xla/service/gpu/musa_gemm_epilogue_thunk.h"
+#include "xla/service/gpu/musa_grouped_gemm_thunk.h"
+#include "xla/service/gpu/musa_hot_tuple_softmax.h"
+#include "xla/service/gpu/musa_reduction_chain.h"
+#include "xla/service/gpu/musa_warp_row_reduction.h"
 #include "xla/service/gpu/nccl_all_gather_thunk.h"
 #include "xla/service/gpu/nccl_all_reduce_thunk.h"
 #include "xla/service/gpu/nccl_all_to_all_thunk.h"
@@ -118,6 +127,7 @@ limitations under the License.
 #include "xla/service/gpu/parallel_loop_emitter.h"
 #include "xla/service/gpu/replica_id_thunk.h"
 #include "xla/service/gpu/sequential_thunk.h"
+#include "xla/service/gpu/target_util.h"
 #include "xla/service/gpu/thunk.h"
 #include "xla/service/gpu/while_thunk.h"
 #include "xla/service/llvm_ir/buffer_assignment_util.h"
@@ -165,6 +175,104 @@ bool UseDefaultDebugOptionsForPjrtPlugin() {
          std::strcmp(env, "false") != 0 && std::strcmp(env, "False") != 0 &&
          std::strcmp(env, "FALSE") != 0;
 }
+
+bool MusaEnvExplicitlyTrue(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && value[0] != '0' &&
+         std::strcmp(value, "false") != 0 && std::strcmp(value, "False") != 0 &&
+         std::strcmp(value, "FALSE") != 0 && std::strcmp(value, "off") != 0;
+}
+
+bool MusaWarpRowReductionReducerAllowed(MusaWarpRowReductionKind kind) {
+  const char* value =
+      std::getenv("MUSA_XLA_WARP_ROW_REDUCTION_REDUCERS");
+  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "all") == 0) {
+    return true;
+  }
+  if (std::strcmp(value, "add") == 0) {
+    return kind == MusaWarpRowReductionKind::kAdd;
+  }
+  if (std::strcmp(value, "multiply") == 0) {
+    return kind == MusaWarpRowReductionKind::kMultiply;
+  }
+  return false;
+}
+
+int64_t MusaWarpRowReductionMinDataElements() {
+  const char* value =
+      std::getenv("MUSA_XLA_WARP_ROW_REDUCTION_MIN_DATA_ELEMENTS");
+  if (value == nullptr || value[0] == '\0') {
+    return 0;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+int64_t MusaMixedTupleWarpRowReductionMinDataElements() {
+  const char* value = std::getenv(
+      "MUSA_XLA_MIXED_TUPLE_WARP_ROW_REDUCTION_MIN_DATA_ELEMENTS");
+  if (value == nullptr || value[0] == '\0') {
+    return MusaWarpRowReductionMinDataElements();
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0) {
+    return MusaWarpRowReductionMinDataElements();
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+int64_t MusaMixedTupleWarpRowReductionSmallWidthMax() {
+  const char* value = std::getenv(
+      "MUSA_XLA_MIXED_TUPLE_WARP_ROW_REDUCTION_SMALL_WIDTH_MAX");
+  if (value == nullptr || value[0] == '\0') {
+    return 0;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+int64_t MusaMixedTupleWarpRowReductionSmallWidthThreadsPerBlock() {
+  const char* value = std::getenv(
+      "MUSA_XLA_MIXED_TUPLE_WARP_ROW_REDUCTION_SMALL_WIDTH_THREADS_PER_BLOCK");
+  if (value == nullptr || value[0] == '\0') {
+    return 0;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0' || parsed <= 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+int64_t MusaWarpRowReductionThreadsPerBlock() {
+  const char* value =
+      std::getenv("MUSA_XLA_WARP_ROW_REDUCTION_THREADS_PER_BLOCK");
+  if (value == nullptr || value[0] == '\0') {
+    return 0;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0) {
+    return -1;
+  }
+  return static_cast<int64_t>(parsed);
+}
+
+class MusaPublicGpuElementalIrEmitter : public GpuElementalIrEmitter {
+ public:
+  using GpuElementalIrEmitter::GpuElementalIrEmitter;
+  using GpuElementalIrEmitter::EmitExp;
+};
 
 // Some HLO operations are not implemented as Thunks, and only available when
 // XLA:GPU compiled for XLA runtime. However we still depend on emitting thunk
@@ -895,6 +1003,336 @@ Status IrEmitterUnnested::EmitGemmThunk(mlir::Operation* op) {
       deterministic_ops);
 
   AddThunkToThunkSequence(std::move(thunk));
+  return OkStatus();
+}
+
+Status IrEmitterUnnested::EmitMusaGemmBetaChainThunk(mlir::Operation* op) {
+  auto custom_call = mlir::cast<mlir::lmhlo::CustomCallOp>(op);
+  const int64_t arg_count = custom_call.getArgs().size();
+  LOG(INFO) << "[MUSA_GEMM_BETA_CHAIN_EMIT] stage=start target="
+            << custom_call.getCallTargetName().str()
+            << " arg_count=" << arg_count
+            << " output_count=" << custom_call.getOutput().size();
+  if (arg_count < 2) {
+    return InvalidArgument(
+        "MUSA GEMM beta-chain custom-call expects at least one lhs/rhs pair");
+  }
+  const bool has_beta_operand = arg_count % 2 == 1;
+  const int64_t pair_arg_count = arg_count - (has_beta_operand ? 1 : 0);
+  if (pair_arg_count % 2 != 0) {
+    return InvalidArgument(
+        "MUSA GEMM beta-chain custom-call expects lhs/rhs operand pairs");
+  }
+  if (custom_call.getOutput().size() != 1) {
+    return InvalidArgument(
+        "MUSA GEMM beta-chain custom-call expects exactly one output");
+  }
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice output,
+                      GetAllocationSlice(custom_call.getOutput().front()));
+  const Shape output_shape = GetShape(custom_call.getOutput().front());
+  LOG(INFO) << "[MUSA_GEMM_BETA_CHAIN_EMIT] stage=output output_shape="
+            << ShapeUtil::HumanString(output_shape)
+            << " output_bytes=" << output.size()
+            << " has_beta_operand=" << has_beta_operand
+            << " pair_count=" << pair_arg_count / 2;
+  std::optional<BufferAllocation::Slice> beta_buffer;
+  if (has_beta_operand) {
+    mlir::Value beta = custom_call.getArgs().back();
+    if (!Shape::Equal().IgnoreElementType()(GetShape(beta), output_shape)) {
+      return InvalidArgument(
+          "MUSA GEMM beta-chain beta operand shape must match output shape");
+    }
+    TF_ASSIGN_OR_RETURN(beta_buffer, GetAllocationSlice(beta));
+  }
+  std::vector<GemmConfig> configs;
+  std::vector<BufferAllocation::Slice> lhs_buffers;
+  std::vector<BufferAllocation::Slice> rhs_buffers;
+  configs.reserve(pair_arg_count / 2);
+  lhs_buffers.reserve(pair_arg_count / 2);
+  rhs_buffers.reserve(pair_arg_count / 2);
+
+  const std::array<int64_t, 1> lhs_contracting_dims = {1};
+  const std::array<int64_t, 1> rhs_contracting_dims = {0};
+  const absl::Span<const int64_t> no_batch_dims =
+      absl::Span<const int64_t>();
+  for (int64_t i = 0; i < pair_arg_count; i += 2) {
+    mlir::Value lhs = custom_call.getArgs()[i];
+    mlir::Value rhs = custom_call.getArgs()[i + 1];
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice lhs_slice,
+                        GetAllocationSlice(lhs));
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice rhs_slice,
+                        GetAllocationSlice(rhs));
+    TF_ASSIGN_OR_RETURN(
+        GemmConfig config,
+        GemmConfig::For(GetShape(lhs), no_batch_dims, lhs_contracting_dims,
+                        GetShape(rhs), no_batch_dims, rhs_contracting_dims,
+                        output_shape,
+                        /*alpha_real=*/1.0, /*alpha_imag=*/0.0,
+                        /*beta=*/(i == 0 && !has_beta_operand) ? 0.0 : 1.0,
+                        /*algorithm=*/std::nullopt,
+                        /*compute_precision=*/0));
+    configs.push_back(std::move(config));
+    lhs_buffers.push_back(lhs_slice);
+    rhs_buffers.push_back(rhs_slice);
+  }
+
+  bool deterministic_ops =
+      ir_emitter_context_->debug_options().xla_gpu_deterministic_ops();
+  LOG(INFO) << "[MUSA_GEMM_BETA_CHAIN_EMIT] stage=add_thunk gemm_count="
+            << configs.size() << " deterministic=" << deterministic_ops;
+  AddThunkToThunkSequence(std::make_unique<MusaGemmBetaChainThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(op), std::move(configs),
+      std::move(lhs_buffers), std::move(rhs_buffers), std::move(beta_buffer),
+      output,
+      deterministic_ops));
+  LOG(INFO) << "[MUSA_GEMM_BETA_CHAIN_EMIT] stage=done";
+  return OkStatus();
+}
+
+Status IrEmitterUnnested::EmitMusaGemmEpilogueThunk(mlir::Operation* op) {
+  auto custom_call = mlir::cast<mlir::lmhlo::CustomCallOp>(op);
+  if (custom_call.getArgs().size() != 3) {
+    return InvalidArgument(
+        "MUSA GEMM epilogue custom-call expects lhs, rhs, and bias operands");
+  }
+  if (custom_call.getOutput().size() != 1) {
+    return InvalidArgument(
+        "MUSA GEMM epilogue custom-call expects exactly one output");
+  }
+
+  mlir::Value lhs = custom_call.getArgs()[0];
+  mlir::Value rhs = custom_call.getArgs()[1];
+  mlir::Value bias = custom_call.getArgs()[2];
+  mlir::Value output_value = custom_call.getOutput().front();
+
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice lhs_buffer,
+                      GetAllocationSlice(lhs));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice rhs_buffer,
+                      GetAllocationSlice(rhs));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice bias_buffer,
+                      GetAllocationSlice(bias));
+  TF_ASSIGN_OR_RETURN(BufferAllocation::Slice output,
+                      GetAllocationSlice(output_value));
+
+  const Shape output_shape = GetShape(output_value);
+  const Shape bias_shape = GetShape(bias);
+  if (output_shape.rank() != 2) {
+    return InvalidArgument(
+        "MUSA GEMM epilogue custom-call only supports rank-2 output");
+  }
+  if (!(bias_shape.rank() == 0 ||
+        (bias_shape.rank() == 1 &&
+         bias_shape.dimensions(0) == output_shape.dimensions(1)))) {
+    return InvalidArgument(
+        "MUSA GEMM epilogue custom-call expects scalar or column bias");
+  }
+
+  const Shape lhs_shape = GetShape(lhs);
+  const Shape rhs_shape = GetShape(rhs);
+  if (lhs_shape.rank() != 2 || rhs_shape.rank() != 2 ||
+      lhs_shape.dimensions(1) != rhs_shape.dimensions(0) ||
+      output_shape.dimensions(0) != lhs_shape.dimensions(0) ||
+      output_shape.dimensions(1) != rhs_shape.dimensions(1)) {
+    return InvalidArgument(
+        "MUSA GEMM epilogue custom-call expects lhs[m,k], rhs[k,n], "
+        "output[m,n]; got lhs=%s rhs=%s output=%s bias=%s",
+        ShapeUtil::HumanString(lhs_shape), ShapeUtil::HumanString(rhs_shape),
+        ShapeUtil::HumanString(output_shape),
+        ShapeUtil::HumanString(bias_shape));
+  }
+
+  const std::array<int64_t, 1> lhs_contracting_dims = {1};
+  const std::array<int64_t, 1> rhs_contracting_dims = {0};
+  const absl::Span<const int64_t> no_batch_dims = absl::Span<const int64_t>();
+  TF_ASSIGN_OR_RETURN(
+      GemmConfig config,
+      GemmConfig::For(lhs_shape, no_batch_dims, lhs_contracting_dims,
+                      rhs_shape, no_batch_dims, rhs_contracting_dims,
+                      output_shape,
+                      /*alpha_real=*/1.0, /*alpha_imag=*/0.0,
+                      /*beta=*/0.0,
+                      /*algorithm=*/std::nullopt,
+                      /*compute_precision=*/0));
+
+  LOG(INFO) << "[MUSA_GEMM_EPILOGUE_EMIT] stage=add_thunk output_shape="
+            << ShapeUtil::HumanString(output_shape)
+            << " bias_shape=" << ShapeUtil::HumanString(bias_shape);
+  AddThunkToThunkSequence(std::make_unique<MusaGemmEpilogueThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(op), std::move(config),
+      lhs_buffer, rhs_buffer, bias_buffer, output));
+  return OkStatus();
+}
+
+Status IrEmitterUnnested::EmitMusaPointerArrayGemmThunk(
+    mlir::Operation* op) {
+  auto custom_call = mlir::cast<mlir::lmhlo::CustomCallOp>(op);
+  const int64_t arg_count = custom_call.getArgs().size();
+  const int64_t output_count = custom_call.getOutput().size();
+  if (arg_count < 4 || arg_count % 2 != 0 || output_count != arg_count / 2) {
+    return InvalidArgument(
+        "MUSA pointer-array GEMM expects lhs/rhs pairs and one output per pair");
+  }
+
+  std::vector<BufferAllocation::Slice> lhs_buffers;
+  std::vector<BufferAllocation::Slice> rhs_buffers;
+  std::vector<BufferAllocation::Slice> output_buffers;
+  lhs_buffers.reserve(output_count);
+  rhs_buffers.reserve(output_count);
+  output_buffers.reserve(output_count);
+
+  const Shape lhs_shape = GetShape(custom_call.getArgs()[0]);
+  const Shape rhs_shape = GetShape(custom_call.getArgs()[1]);
+  const Shape output_shape = GetShape(custom_call.getOutput()[0]);
+  for (int64_t i = 0; i < output_count; ++i) {
+    mlir::Value lhs = custom_call.getArgs()[2 * i];
+    mlir::Value rhs = custom_call.getArgs()[2 * i + 1];
+    mlir::Value output = custom_call.getOutput()[i];
+    if (!Shape::Equal()(GetShape(lhs), lhs_shape) ||
+        !Shape::Equal()(GetShape(rhs), rhs_shape) ||
+        !Shape::Equal()(GetShape(output), output_shape)) {
+      return InvalidArgument(
+          "MUSA pointer-array GEMM requires uniform lhs/rhs/output shapes");
+    }
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice lhs_buffer,
+                        GetAllocationSlice(lhs));
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice rhs_buffer,
+                        GetAllocationSlice(rhs));
+    TF_ASSIGN_OR_RETURN(BufferAllocation::Slice output_buffer,
+                        GetAllocationSlice(output));
+    lhs_buffers.push_back(lhs_buffer);
+    rhs_buffers.push_back(rhs_buffer);
+    output_buffers.push_back(output_buffer);
+  }
+
+  const std::array<int64_t, 1> lhs_contracting_dims = {1};
+  const std::array<int64_t, 1> rhs_contracting_dims = {0};
+  const absl::Span<const int64_t> no_batch_dims = absl::Span<const int64_t>();
+  TF_ASSIGN_OR_RETURN(
+      GemmConfig config,
+      GemmConfig::For(lhs_shape, no_batch_dims, lhs_contracting_dims,
+                      rhs_shape, no_batch_dims, rhs_contracting_dims,
+                      output_shape,
+                      /*alpha_real=*/1.0, /*alpha_imag=*/0.0,
+                      /*beta=*/0.0, /*algorithm=*/std::nullopt,
+                      /*compute_precision=*/0));
+  bool deterministic_ops =
+      ir_emitter_context_->debug_options().xla_gpu_deterministic_ops();
+  AddThunkToThunkSequence(std::make_unique<MusaPointerArrayGemmThunk>(
+      Thunk::ThunkInfo::WithProfileAnnotation(op), std::move(config),
+      std::move(lhs_buffers), std::move(rhs_buffers),
+      std::move(output_buffers), deterministic_ops));
+  return OkStatus();
+}
+
+Status IrEmitterUnnested::EmitMusaSmallKDotThunk(mlir::Operation* op) {
+  auto custom_call = mlir::cast<mlir::lmhlo::CustomCallOp>(op);
+  const int64_t arg_count = custom_call.getArgs().size();
+  const int64_t output_count = custom_call.getOutput().size();
+  if (arg_count < 4 || arg_count % 2 != 0 || output_count != arg_count / 2) {
+    return InvalidArgument(
+        "MUSA small-K Dot expects lhs/rhs pairs and one output per pair");
+  }
+
+  const Shape lhs_shape = GetShape(custom_call.getArgs()[0]);
+  const Shape rhs_shape = GetShape(custom_call.getArgs()[1]);
+  const Shape output_shape = GetShape(custom_call.getOutput()[0]);
+  if (lhs_shape.rank() != 2 || rhs_shape.rank() != 2 ||
+      output_shape.rank() != 2 || lhs_shape.element_type() != F32 ||
+      rhs_shape.element_type() != F32 || output_shape.element_type() != F32 ||
+      lhs_shape.dimensions(1) != rhs_shape.dimensions(0) ||
+      lhs_shape.dimensions(0) != output_shape.dimensions(0) ||
+      rhs_shape.dimensions(1) != output_shape.dimensions(1) ||
+      lhs_shape.dimensions(1) <= 0 || lhs_shape.dimensions(1) > 8) {
+    return InvalidArgument(
+        "MUSA small-K Dot LLVM kernel expects uniform rank-2 f32 dots with K "
+        "in [1, 8]");
+  }
+  for (int64_t i = 0; i < output_count; ++i) {
+    mlir::Value lhs = custom_call.getArgs()[2 * i];
+    mlir::Value rhs = custom_call.getArgs()[2 * i + 1];
+    mlir::Value output = custom_call.getOutput()[i];
+    if (!Shape::Equal()(GetShape(lhs), lhs_shape) ||
+        !Shape::Equal()(GetShape(rhs), rhs_shape) ||
+        !Shape::Equal()(GetShape(output), output_shape)) {
+      return InvalidArgument(
+          "MUSA small-K Dot requires uniform lhs/rhs/output shapes");
+    }
+  }
+
+  TF_ASSIGN_OR_RETURN(LaunchDimensions launch_dimensions,
+                      CalculateLaunchDimensions(
+                          output_shape, ir_emitter_context_->gpu_device_info()));
+  llvm::SmallVector<mlir::Value, 64> kernel_operands;
+  kernel_operands.reserve(arg_count + output_count);
+  kernel_operands.append(custom_call.getArgs().begin(),
+                         custom_call.getArgs().end());
+  kernel_operands.append(custom_call.getOutput().begin(),
+                         custom_call.getOutput().end());
+  TF_ASSIGN_OR_RETURN(
+      auto ir_arrays,
+      BuildKernelThunkForNonFusionOp(custom_call, kernel_operands,
+                                     launch_dimensions));
+  auto& [all_arrays, helper_outputs] = ir_arrays;
+  TF_RET_CHECK(helper_outputs.empty());
+  TF_RET_CHECK(all_arrays.size() == arg_count + output_count);
+  std::vector<llvm_ir::IrArray> inputs(all_arrays.begin(),
+                                       all_arrays.begin() + arg_count);
+  std::vector<llvm_ir::IrArray> output_arrays(
+      all_arrays.begin() + arg_count, all_arrays.end());
+  TF_RET_CHECK(output_arrays.size() == output_count);
+
+  llvm::Type* f32_type = llvm_ir::PrimitiveTypeToIrType(F32, module_);
+  std::vector<llvm::Type*> element_types(output_count, f32_type);
+  llvm::Type* result_type =
+      llvm::StructType::get(b_.getContext(), element_types);
+  const int64_t k_dim = lhs_shape.dimensions(1);
+
+  auto body_generator = [=, this](const llvm_ir::IrArray::Index& index)
+      -> StatusOr<llvm::Value*> {
+    llvm::Value* row = index.multidim()[0];
+    llvm::Value* col = index.multidim()[1];
+    llvm::Value* result = llvm::UndefValue::get(result_type);
+    for (int64_t dot_index = 0; dot_index < output_count; ++dot_index) {
+      llvm::Value* acc = llvm::ConstantFP::get(f32_type, 0.0);
+      for (int64_t kk = 0; kk < k_dim; ++kk) {
+        llvm::Value* k_value = index.GetConstantWithIndexType(kk);
+        llvm::Value* lhs_multi[] = {row, k_value};
+        llvm::Value* rhs_multi[] = {k_value, col};
+        llvm_ir::IrArray::Index lhs_index(
+            absl::MakeSpan(lhs_multi), lhs_shape, index.GetType());
+        llvm_ir::IrArray::Index rhs_index(
+            absl::MakeSpan(rhs_multi), rhs_shape, index.GetType());
+        llvm::Value* lhs_value =
+            inputs[2 * dot_index].EmitReadArrayElement(lhs_index, &b_);
+        llvm::Value* rhs_value =
+            inputs[2 * dot_index + 1].EmitReadArrayElement(rhs_index, &b_);
+        acc = b_.CreateFAdd(acc, b_.CreateFMul(lhs_value, rhs_value));
+      }
+      result = b_.CreateInsertValue(result, acc, dot_index);
+    }
+    return result;
+  };
+
+  const char* small_k_diag = std::getenv("MUSA_SMALL_K_DOT_KERNEL_DIAGNOSTICS");
+  const char* thunk_diag = std::getenv("MUSA_XLA_THUNK_DIAGNOSTICS");
+  const bool log_small_k_kernel =
+      VLOG_IS_ON(1) ||
+      (small_k_diag != nullptr && small_k_diag[0] != '\0' &&
+       small_k_diag[0] != '0') ||
+      (thunk_diag != nullptr && thunk_diag[0] != '\0' &&
+       thunk_diag[0] != '0');
+  if (log_small_k_kernel) {
+    LOG(INFO) << "[MUSA_SMALL_K_DOT_KERNEL]"
+              << " outputs=" << output_count
+              << " m=" << output_shape.dimensions(0)
+              << " n=" << output_shape.dimensions(1)
+              << " k=" << k_dim
+              << " launch=" << launch_dimensions.ToString();
+  }
+  TF_RETURN_IF_ERROR(ParallelLoopEmitter(body_generator, output_arrays,
+                                         launch_dimensions, &b_)
+                         .EmitLoop(GetIrNameFromLoc(op->getLoc())));
   return OkStatus();
 }
 
@@ -1760,6 +2198,1412 @@ Status IrEmitterUnnested::EmitTritonFusion(
 
 #endif  // GOOGLE_CUDA
 
+StatusOr<bool> IrEmitterUnnested::TryEmitMusaHotTupleSoftmaxFusion(
+    mlir::lmhlo::FusionOp fusion_op,
+    const HloFusionInstruction* fusion) {
+  if (!MusaEnvExplicitlyTrue("MUSA_XLA_HOT_TUPLE_SOFTMAX_KERNEL")) {
+    return false;
+  }
+  const HloComputation* fused_computation =
+      fusion->fused_instructions_computation();
+  std::optional<MusaHotTupleSoftmaxMatch> match =
+      MatchMusaHotTupleSoftmaxFusion(fusion, fused_computation);
+  if (!match.has_value()) {
+    return false;
+  }
+
+  const int64_t rows = match->groups.front().rows;
+  const int64_t group_count = match->groups.size();
+  const Shape& output_shape = match->groups.front().sum_reduce->shape();
+  const int64_t warp_size =
+      WarpSize(ir_emitter_context_->gpu_device_info());
+  TF_RET_CHECK(warp_size > 0 && (warp_size & (warp_size - 1)) == 0);
+  int64_t max_width = 0;
+  for (const MusaHotTupleSoftmaxGroupMatch& group : match->groups) {
+    max_width = std::max(max_width, group.width);
+  }
+  const int64_t warps_per_block =
+      (max_width + warp_size - 1) / warp_size;
+  if (warps_per_block > 2) {
+    return false;
+  }
+  const int64_t threads_per_block = warps_per_block * warp_size;
+  LaunchDimensions launch_dimensions(
+      LaunchDimensions::Dim3D{rows, group_count, 1},
+      LaunchDimensions::Dim3D{threads_per_block, 1, 1});
+
+  auto builder_fn = [&, this](std::vector<llvm_ir::IrArray> inputs,
+                              std::vector<llvm_ir::IrArray> outputs) -> Status {
+    TF_RET_CHECK(inputs.size() == fused_computation->num_parameters());
+    TF_RET_CHECK(outputs.size() == match->groups.size() * 2);
+
+    FusedIrEmitter hot_tuple_softmax_emitter(elemental_emitter_);
+    for (int64_t i = 0; i < fused_computation->num_parameters(); ++i) {
+      const HloInstruction* parameter =
+          fused_computation->parameter_instruction(i);
+      hot_tuple_softmax_emitter.BindGenerator(
+          *parameter,
+          [this, input = inputs[i], parameter](llvm_ir::IrArray::Index index) {
+            return input.EmitReadArrayElement(index, &b_, parameter->name());
+          });
+    }
+
+    std::vector<llvm_ir::ElementGenerator> data_generators;
+    data_generators.reserve(match->groups.size());
+    for (const MusaHotTupleSoftmaxGroupMatch& group : match->groups) {
+      TF_ASSIGN_OR_RETURN(
+          llvm_ir::ElementGenerator generator,
+          hot_tuple_softmax_emitter.GetGenerator(*group.data));
+      data_generators.push_back(std::move(generator));
+    }
+
+    llvm::Type* f32_type = llvm_ir::PrimitiveTypeToIrType(F32, module_);
+    llvm::Type* shared_partials_type =
+        llvm::ArrayType::get(f32_type, warps_per_block);
+    llvm::GlobalVariable* shared_max_partials =
+        llvm_ir::AllocateSharedMemoryTile(
+            module_, shared_partials_type,
+            "musa_hot_tuple_softmax_shared_max_partials");
+    llvm::GlobalVariable* shared_sum_partials =
+        llvm_ir::AllocateSharedMemoryTile(
+            module_, shared_partials_type,
+            "musa_hot_tuple_softmax_shared_sum_partials");
+    MusaPublicGpuElementalIrEmitter math_emitter(*ir_emitter_context_, &b_);
+    const bool enable_fast_min_max =
+        ir_emitter_context_->debug_options().xla_gpu_enable_fast_min_max();
+    llvm::Value* lane = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kThreadIdx, {}, {}, &b_);
+    llvm::Value* row = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kBlockIdx, {}, {}, &b_);
+    llvm::Value* runtime_group = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kBlockIdy, {}, {}, &b_);
+    llvm::Value* warp_size_value =
+        llvm::ConstantInt::get(lane->getType(), warp_size);
+    llvm::Value* warp_id = b_.CreateUDiv(lane, warp_size_value);
+    llvm::Value* lane_id = b_.CreateURem(lane, warp_size_value);
+    llvm::Value* lane_is_first = b_.CreateICmpEQ(
+        lane_id, llvm::ConstantInt::get(lane_id->getType(), 0));
+    llvm::Value* is_first_warp = b_.CreateICmpEQ(
+        warp_id, llvm::ConstantInt::get(warp_id->getType(), 0));
+    llvm::Value* thread_is_zero =
+        b_.CreateICmpEQ(lane, llvm::ConstantInt::get(lane->getType(), 0));
+    auto shared_partial_address = [&](llvm::GlobalVariable* shared_partials,
+                                      llvm::Value* index) -> llvm::Value* {
+      return b_.CreateInBoundsGEP(
+          shared_partials_type, shared_partials,
+          {llvm::ConstantInt::get(index->getType(), 0), index});
+    };
+    KernelSupportLibrary ksl(&b_);
+
+    for (int64_t group_index = 0; group_index < group_count; ++group_index) {
+      const MusaHotTupleSoftmaxGroupMatch& group =
+          match->groups[group_index];
+      llvm::Value* is_runtime_group = b_.CreateICmpEQ(
+          runtime_group,
+          llvm::ConstantInt::get(runtime_group->getType(), group_index));
+      TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+          absl::StrCat("hot_tuple_softmax_group_", group_index),
+          is_runtime_group, [&]() -> Status {
+            llvm_ir::IrArray::Index output_index(
+                row, group.sum_reduce->shape(), &b_);
+            std::vector<llvm::Value*> data_multi(
+                output_index.multidim().begin(),
+                output_index.multidim().end());
+            data_multi.push_back(lane);
+            llvm_ir::IrArray::Index data_index(
+                absl::MakeSpan(data_multi), group.data->shape(),
+                output_index.GetType());
+            llvm::Value* lane_is_active = b_.CreateICmpULT(
+                lane,
+                llvm::ConstantInt::get(lane->getType(), group.width));
+
+            llvm::Value* lane_max_address =
+                llvm_ir::EmitAllocaAtFunctionEntry(
+                    f32_type,
+                    absl::StrCat("hot_tuple_softmax_lane_max_", group_index),
+                    &b_);
+            b_.CreateStore(llvm::ConstantFP::getInfinity(
+                               f32_type, /*Negative=*/true),
+                           lane_max_address);
+            TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                absl::StrCat("hot_tuple_softmax_read_max_", group_index),
+                lane_is_active, [&]() -> Status {
+                  TF_ASSIGN_OR_RETURN(
+                      llvm::Value * data_value,
+                      data_generators[group_index](data_index));
+                  b_.CreateStore(data_value, lane_max_address);
+                  return OkStatus();
+                }));
+
+            llvm::Value* max_value =
+                b_.CreateLoad(f32_type, lane_max_address);
+            for (int64_t distance = warp_size / 2; distance > 0;
+                 distance /= 2) {
+              llvm::Value* other = EmitFullWarpShuffleDown(
+                  max_value, b_.getInt32(distance), &b_, warp_size);
+              max_value = llvm_ir::EmitFloatMax(
+                  max_value, other, &b_, enable_fast_min_max,
+                  absl::StrCat("hot_tuple_softmax_warp_max_", group_index));
+            }
+            ksl.If(absl::StrCat("hot_tuple_softmax_store_max_", group_index),
+                   lane_is_first, [&]() {
+                     b_.CreateStore(
+                         max_value, shared_partial_address(
+                                        shared_max_partials, warp_id));
+                   });
+            EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {}, {},
+                                      &b_);
+            if (warps_per_block > 1) {
+              TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                  absl::StrCat("hot_tuple_softmax_inter_warp_max_",
+                               group_index),
+                  is_first_warp, [&]() -> Status {
+                    llvm::Value* block_max_address =
+                        llvm_ir::EmitAllocaAtFunctionEntry(
+                            f32_type,
+                            absl::StrCat("hot_tuple_softmax_block_max_",
+                                         group_index),
+                            &b_);
+                    b_.CreateStore(llvm::ConstantFP::getInfinity(
+                                       f32_type, /*Negative=*/true),
+                                   block_max_address);
+                    llvm::Value* partial_exists = b_.CreateICmpULT(
+                        lane_id,
+                        llvm::ConstantInt::get(lane_id->getType(),
+                                               warps_per_block));
+                    TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                        absl::StrCat(
+                            "hot_tuple_softmax_load_partial_max_",
+                            group_index),
+                        partial_exists, [&]() -> Status {
+                          llvm::Value* partial = b_.CreateLoad(
+                              f32_type,
+                              shared_partial_address(shared_max_partials,
+                                                     lane_id));
+                          b_.CreateStore(partial, block_max_address);
+                          return OkStatus();
+                        }));
+                    llvm::Value* block_max =
+                        b_.CreateLoad(f32_type, block_max_address);
+                    for (int64_t distance = warp_size / 2; distance > 0;
+                         distance /= 2) {
+                      llvm::Value* other = EmitFullWarpShuffleDown(
+                          block_max, b_.getInt32(distance), &b_, warp_size);
+                      block_max = llvm_ir::EmitFloatMax(
+                          block_max, other, &b_, enable_fast_min_max,
+                          absl::StrCat("hot_tuple_softmax_block_max_reduce_",
+                                       group_index));
+                    }
+                    ksl.If(
+                        absl::StrCat("hot_tuple_softmax_publish_max_",
+                                     group_index),
+                        thread_is_zero, [&]() {
+                          b_.CreateStore(
+                              block_max,
+                              shared_partial_address(shared_max_partials,
+                                                     b_.getInt32(0)));
+                        });
+                    return OkStatus();
+                  }));
+              EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {},
+                                        {}, &b_);
+            }
+            llvm::Value* shared_max_value = b_.CreateLoad(
+                f32_type, shared_partial_address(shared_max_partials,
+                                                 b_.getInt32(0)));
+
+            llvm::Value* lane_sum_address =
+                llvm_ir::EmitAllocaAtFunctionEntry(
+                    f32_type,
+                    absl::StrCat("hot_tuple_softmax_lane_sum_", group_index),
+                    &b_);
+            b_.CreateStore(llvm::ConstantFP::get(f32_type, 0.0),
+                           lane_sum_address);
+            TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                absl::StrCat("hot_tuple_softmax_read_sum_", group_index),
+                lane_is_active, [&]() -> Status {
+                  TF_ASSIGN_OR_RETURN(
+                      llvm::Value * data_value,
+                      data_generators[group_index](data_index));
+                  llvm::Value* centered =
+                      b_.CreateFSub(data_value, shared_max_value);
+                  TF_ASSIGN_OR_RETURN(
+                      llvm::Value * exp_value,
+                      math_emitter.EmitExp(F32, centered, ""));
+                  b_.CreateStore(exp_value, lane_sum_address);
+                  return OkStatus();
+                }));
+
+            llvm::Value* sum_value =
+                b_.CreateLoad(f32_type, lane_sum_address);
+            for (int64_t distance = warp_size / 2; distance > 0;
+                 distance /= 2) {
+              sum_value = b_.CreateFAdd(
+                  sum_value,
+                  EmitFullWarpShuffleDown(sum_value, b_.getInt32(distance),
+                                          &b_, warp_size));
+            }
+            if (warps_per_block == 1) {
+              ksl.If(
+                  absl::StrCat("hot_tuple_softmax_write_", group_index),
+                  thread_is_zero, [&]() {
+                    outputs[group_index * 2].EmitWriteArrayElement(
+                        output_index, sum_value, &b_);
+                    outputs[group_index * 2 + 1].EmitWriteArrayElement(
+                        output_index, shared_max_value, &b_);
+                  });
+            } else {
+              ksl.If(
+                  absl::StrCat("hot_tuple_softmax_store_sum_", group_index),
+                  lane_is_first, [&]() {
+                    b_.CreateStore(
+                        sum_value,
+                        shared_partial_address(shared_sum_partials, warp_id));
+                  });
+              EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {},
+                                        {}, &b_);
+              TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                  absl::StrCat("hot_tuple_softmax_inter_warp_sum_",
+                               group_index),
+                  is_first_warp, [&]() -> Status {
+                    llvm::Value* block_sum_address =
+                        llvm_ir::EmitAllocaAtFunctionEntry(
+                            f32_type,
+                            absl::StrCat("hot_tuple_softmax_block_sum_",
+                                         group_index),
+                            &b_);
+                    b_.CreateStore(llvm::ConstantFP::get(f32_type, 0.0),
+                                   block_sum_address);
+                    llvm::Value* partial_exists = b_.CreateICmpULT(
+                        lane_id,
+                        llvm::ConstantInt::get(lane_id->getType(),
+                                               warps_per_block));
+                    TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                        absl::StrCat(
+                            "hot_tuple_softmax_load_partial_sum_",
+                            group_index),
+                        partial_exists, [&]() -> Status {
+                          llvm::Value* partial = b_.CreateLoad(
+                              f32_type,
+                              shared_partial_address(shared_sum_partials,
+                                                     lane_id));
+                          b_.CreateStore(partial, block_sum_address);
+                          return OkStatus();
+                        }));
+                    llvm::Value* block_sum =
+                        b_.CreateLoad(f32_type, block_sum_address);
+                    for (int64_t distance = warp_size / 2; distance > 0;
+                         distance /= 2) {
+                      block_sum = b_.CreateFAdd(
+                          block_sum,
+                          EmitFullWarpShuffleDown(
+                              block_sum, b_.getInt32(distance), &b_,
+                              warp_size));
+                    }
+                    ksl.If(
+                        absl::StrCat("hot_tuple_softmax_write_",
+                                     group_index),
+                        thread_is_zero, [&]() {
+                          outputs[group_index * 2].EmitWriteArrayElement(
+                              output_index, block_sum, &b_);
+                          outputs[group_index * 2 + 1]
+                              .EmitWriteArrayElement(
+                                  output_index, shared_max_value, &b_);
+                        });
+                    return OkStatus();
+                  }));
+            }
+            return OkStatus();
+          }));
+    }
+    return OkStatus();
+  };
+
+  TF_ASSIGN_OR_RETURN(
+      auto thunk,
+      BuildKernelThunkForFusion(
+          *ir_emitter_context_, kernel_reuse_cache_, fusion_op,
+          fused_computation, launch_dimensions,
+          /*discriminator=*/"musa_hot_tuple_softmax", builder_fn, &b_));
+  AddThunkToThunkSequence(std::move(thunk));
+
+  std::vector<std::string> widths;
+  widths.reserve(match->groups.size());
+  for (const MusaHotTupleSoftmaxGroupMatch& group : match->groups) {
+    widths.push_back(absl::StrCat(group.width));
+  }
+  return true;
+}
+
+StatusOr<bool> IrEmitterUnnested::TryEmitMusaReductionChainFusion(
+    mlir::lmhlo::FusionOp fusion_op,
+    const HloFusionInstruction* fusion) {
+  const auto& frontend_attributes = fusion->frontend_attributes().map();
+  auto marker = frontend_attributes.find("musa_reduction_chain");
+  const bool marked_for_reduction_chain =
+      marker != frontend_attributes.end() && marker->second == "1";
+  auto reject_unsupported =
+      [&](absl::string_view reason) -> StatusOr<bool> {
+    if (marked_for_reduction_chain) {
+      return tsl::errors::Internal(
+          "MUSA reduction-chain dedicated emitter rejected marked fusion ",
+          fusion->name(), ": ", reason);
+    }
+    return false;
+  };
+  if (!MusaEnvExplicitlyTrue("MUSA_XLA_REDUCTION_CHAIN_KERNEL")) {
+    return reject_unsupported("kernel is disabled");
+  }
+  const HloComputation* fused_computation =
+      fusion->fused_instructions_computation();
+  std::optional<MusaReductionChainMatch> match =
+      MatchMusaReductionChainFusion(fusion, fused_computation);
+  if (!match.has_value()) {
+    return reject_unsupported("matcher rejected fusion body");
+  }
+
+  const int64_t warp_size =
+      WarpSize(ir_emitter_context_->gpu_device_info());
+  if (warp_size <= 0 || (warp_size & (warp_size - 1)) != 0) {
+    return reject_unsupported("warp size is not a positive power of two");
+  }
+  const int64_t warps_per_block =
+      (match->width + warp_size - 1) / warp_size;
+  if (warps_per_block <= 0 || warps_per_block > warp_size) {
+    return reject_unsupported("required warps per block are unsupported");
+  }
+  const int64_t threads_per_block = warps_per_block * warp_size;
+  if (threads_per_block >
+      ir_emitter_context_->gpu_device_info().threads_per_block_limit()) {
+    return reject_unsupported("required threads exceed device limit");
+  }
+  LaunchDimensions launch_dimensions(
+      LaunchDimensions::Dim3D{match->rows, 1, 1},
+      LaunchDimensions::Dim3D{threads_per_block, 1, 1});
+
+  auto builder_fn = [&, this](std::vector<llvm_ir::IrArray> inputs,
+                              std::vector<llvm_ir::IrArray> outputs) -> Status {
+    TF_RET_CHECK(inputs.size() == fused_computation->num_parameters());
+    TF_RET_CHECK(outputs.size() == 1);
+
+    FusedIrEmitter reduction_chain_emitter(elemental_emitter_);
+    for (int64_t i = 0; i < fused_computation->num_parameters(); ++i) {
+      const HloInstruction* parameter =
+          fused_computation->parameter_instruction(i);
+      reduction_chain_emitter.BindGenerator(
+          *parameter,
+          [this, input = inputs[i], parameter](llvm_ir::IrArray::Index index) {
+            return input.EmitReadArrayElement(index, &b_, parameter->name());
+          });
+    }
+    TF_ASSIGN_OR_RETURN(
+        llvm_ir::ElementGenerator first_data_generator,
+        reduction_chain_emitter.GetGenerator(*match->first_data));
+
+    llvm::Type* f32_type = llvm_ir::PrimitiveTypeToIrType(F32, module_);
+    llvm::Type* shared_partials_type =
+        llvm::ArrayType::get(f32_type, warps_per_block);
+    llvm::GlobalVariable* first_shared_partials =
+        llvm_ir::AllocateSharedMemoryTile(
+            module_, shared_partials_type,
+            "musa_reduction_chain_first_shared_partials");
+    llvm::GlobalVariable* second_shared_partials =
+        llvm_ir::AllocateSharedMemoryTile(
+            module_, shared_partials_type,
+            "musa_reduction_chain_second_shared_partials");
+    auto shared_partial_address = [&](llvm::GlobalVariable* shared_partials,
+                                      llvm::Value* index) -> llvm::Value* {
+      return b_.CreateInBoundsGEP(
+          shared_partials_type, shared_partials,
+          {llvm::ConstantInt::get(index->getType(), 0), index});
+    };
+
+    reduction_chain_emitter.BindGenerator(
+        *match->first_reduce,
+        [&, this](llvm_ir::IrArray::Index) -> StatusOr<llvm::Value*> {
+          return b_.CreateLoad(
+              f32_type,
+              shared_partial_address(first_shared_partials, b_.getInt32(0)));
+        });
+    TF_ASSIGN_OR_RETURN(
+        llvm_ir::ElementGenerator second_data_generator,
+        reduction_chain_emitter.GetGenerator(*match->second_data));
+    reduction_chain_emitter.BindGenerator(
+        *match->second_reduce,
+        [&, this](llvm_ir::IrArray::Index) -> StatusOr<llvm::Value*> {
+          return b_.CreateLoad(
+              f32_type,
+              shared_partial_address(second_shared_partials, b_.getInt32(0)));
+        });
+    TF_ASSIGN_OR_RETURN(
+        llvm_ir::ElementGenerator final_generator,
+        reduction_chain_emitter.GetGenerator(*match->root));
+
+    llvm::Value* thread = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kThreadIdx, {}, {}, &b_);
+    llvm::Value* row = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kBlockIdx, {}, {}, &b_);
+    llvm::Value* warp_size_value =
+        llvm::ConstantInt::get(thread->getType(), warp_size);
+    llvm::Value* warp_id = b_.CreateUDiv(thread, warp_size_value);
+    llvm::Value* lane_id = b_.CreateURem(thread, warp_size_value);
+    llvm::Value* lane_is_first = b_.CreateICmpEQ(
+        lane_id, llvm::ConstantInt::get(lane_id->getType(), 0));
+    llvm::Value* is_first_warp = b_.CreateICmpEQ(
+        warp_id, llvm::ConstantInt::get(warp_id->getType(), 0));
+    llvm::Value* thread_is_zero = b_.CreateICmpEQ(
+        thread, llvm::ConstantInt::get(thread->getType(), 0));
+    llvm::Value* lane_is_active = b_.CreateICmpULT(
+        thread, llvm::ConstantInt::get(thread->getType(), match->width));
+    llvm::Constant* identity = llvm::ConstantFP::get(f32_type, 1.0);
+    KernelSupportLibrary ksl(&b_);
+
+    llvm_ir::IrArray::Index reduction_output_index(
+        row, match->first_reduce->shape(), &b_);
+    std::vector<llvm::Value*> data_multi(
+        reduction_output_index.multidim().begin(),
+        reduction_output_index.multidim().end());
+    data_multi.push_back(thread);
+    llvm_ir::IrArray::Index data_index(
+        absl::MakeSpan(data_multi), match->first_data->shape(),
+        reduction_output_index.GetType());
+
+    auto emit_reduction_phase =
+        [&](absl::string_view phase_name,
+            const llvm_ir::ElementGenerator& data_generator,
+            llvm::GlobalVariable* shared_partials) -> Status {
+      llvm::Value* lane_value_address = llvm_ir::EmitAllocaAtFunctionEntry(
+          f32_type, absl::StrCat("musa_reduction_chain_", phase_name,
+                                 "_lane_value"),
+          &b_);
+      b_.CreateStore(identity, lane_value_address);
+      TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+          absl::StrCat("musa_reduction_chain_", phase_name, "_read"),
+          lane_is_active, [&]() -> Status {
+            TF_ASSIGN_OR_RETURN(llvm::Value * data_value,
+                                data_generator(data_index));
+            b_.CreateStore(data_value, lane_value_address);
+            return OkStatus();
+          }));
+
+      llvm::Value* value = b_.CreateLoad(f32_type, lane_value_address);
+      for (int64_t distance = warp_size / 2; distance > 0; distance /= 2) {
+        value = b_.CreateFMul(
+            value, EmitFullWarpShuffleDown(value, b_.getInt32(distance), &b_,
+                                           warp_size));
+      }
+      ksl.If(absl::StrCat("musa_reduction_chain_", phase_name,
+                          "_store_partial"),
+             lane_is_first, [&]() {
+               b_.CreateStore(
+                   value, shared_partial_address(shared_partials, warp_id));
+             });
+      EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {}, {}, &b_);
+
+      TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+          absl::StrCat("musa_reduction_chain_", phase_name, "_finish"),
+          is_first_warp, [&]() -> Status {
+            llvm::Value* block_value_address =
+                llvm_ir::EmitAllocaAtFunctionEntry(
+                    f32_type,
+                    absl::StrCat("musa_reduction_chain_", phase_name,
+                                 "_block_value"),
+                    &b_);
+            b_.CreateStore(identity, block_value_address);
+            llvm::Value* partial_exists = b_.CreateICmpULT(
+                lane_id,
+                llvm::ConstantInt::get(lane_id->getType(), warps_per_block));
+            TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                absl::StrCat("musa_reduction_chain_", phase_name,
+                             "_load_partial"),
+                partial_exists, [&]() -> Status {
+                  b_.CreateStore(
+                      b_.CreateLoad(
+                          f32_type,
+                          shared_partial_address(shared_partials, lane_id)),
+                      block_value_address);
+                  return OkStatus();
+                }));
+            llvm::Value* block_value =
+                b_.CreateLoad(f32_type, block_value_address);
+            for (int64_t distance = warp_size / 2; distance > 0;
+                 distance /= 2) {
+              block_value = b_.CreateFMul(
+                  block_value,
+                  EmitFullWarpShuffleDown(block_value, b_.getInt32(distance),
+                                          &b_, warp_size));
+            }
+            ksl.If(absl::StrCat("musa_reduction_chain_", phase_name,
+                                "_publish"),
+                   thread_is_zero, [&]() {
+                     b_.CreateStore(
+                         block_value,
+                         shared_partial_address(shared_partials,
+                                                b_.getInt32(0)));
+                   });
+            return OkStatus();
+          }));
+      EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {}, {}, &b_);
+      return OkStatus();
+    };
+
+    TF_RETURN_IF_ERROR(emit_reduction_phase(
+        "first", first_data_generator, first_shared_partials));
+    TF_RETURN_IF_ERROR(emit_reduction_phase(
+        "second", second_data_generator, second_shared_partials));
+
+    TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+        "musa_reduction_chain_write_final", lane_is_active, [&]() -> Status {
+          llvm_ir::IrArray::Index final_index(
+              absl::MakeSpan(data_multi), match->root->shape(),
+              reduction_output_index.GetType());
+          TF_ASSIGN_OR_RETURN(llvm::Value * final_value,
+                              final_generator(final_index));
+          outputs[0].EmitWriteArrayElement(final_index, final_value, &b_);
+          return OkStatus();
+        }));
+    return OkStatus();
+  };
+
+  TF_ASSIGN_OR_RETURN(
+      auto thunk,
+      BuildKernelThunkForFusion(
+          *ir_emitter_context_, kernel_reuse_cache_, fusion_op,
+          fused_computation, launch_dimensions,
+          /*discriminator=*/"musa_reduction_chain", builder_fn, &b_));
+  AddThunkToThunkSequence(std::move(thunk));
+
+  LOG(INFO) << "[MUSA_REDUCTION_CHAIN_KERNEL] fusion=" << fusion->name()
+            << " rows=" << match->rows << " width=" << match->width
+            << " reducer=multiply"
+            << " warps_per_block=" << warps_per_block
+            << " threads_per_block=" << threads_per_block
+            << " launch=" << launch_dimensions.ToString();
+  return true;
+}
+
+StatusOr<bool> IrEmitterUnnested::TryEmitMusaWarpRowReductionFusion(
+    mlir::lmhlo::FusionOp fusion_op,
+    const HloFusionInstruction* fusion) {
+  if (!MusaEnvExplicitlyTrue("MUSA_XLA_WARP_ROW_REDUCTION_KERNEL")) {
+    return false;
+  }
+  const HloComputation* fused_computation =
+      fusion->fused_instructions_computation();
+  std::optional<MusaWarpRowReductionMatch> match =
+      MatchMusaWarpRowReductionFusion(fusion, fused_computation);
+  if (!match.has_value()) {
+    return false;
+  }
+  if (!MusaWarpRowReductionReducerAllowed(match->kind)) {
+    return false;
+  }
+  const int64_t data_elements = match->rows * match->width;
+  const int64_t min_data_elements =
+      MusaWarpRowReductionMinDataElements();
+  if (data_elements < min_data_elements) {
+    return false;
+  }
+
+  const int64_t warp_size =
+      WarpSize(ir_emitter_context_->gpu_device_info());
+  if (warp_size <= 0 || (warp_size & (warp_size - 1)) != 0) {
+    return false;
+  }
+  const int64_t requested_threads_per_block =
+      MusaWarpRowReductionThreadsPerBlock();
+  std::optional<MusaWarpRowReductionLaunchConfig> launch_config =
+      ResolveMusaWarpRowReductionLaunchConfig(
+          match->width, warp_size,
+          ir_emitter_context_->gpu_device_info().threads_per_block_limit(),
+          requested_threads_per_block);
+  if (!launch_config.has_value()) {
+    return false;
+  }
+  const int64_t warps_per_block = launch_config->warps_per_block;
+  const int64_t threads_per_block = launch_config->threads_per_block;
+  LaunchDimensions launch_dimensions(
+      LaunchDimensions::Dim3D{match->rows, 1, 1},
+      LaunchDimensions::Dim3D{threads_per_block, 1, 1});
+
+  auto builder_fn = [&, this](std::vector<llvm_ir::IrArray> inputs,
+                              std::vector<llvm_ir::IrArray> outputs) -> Status {
+    TF_RET_CHECK(inputs.size() == fused_computation->num_parameters());
+    TF_RET_CHECK(outputs.size() == 1);
+
+    FusedIrEmitter warp_row_reduction_emitter(elemental_emitter_);
+    for (int64_t i = 0; i < fused_computation->num_parameters(); ++i) {
+      const HloInstruction* parameter =
+          fused_computation->parameter_instruction(i);
+      warp_row_reduction_emitter.BindGenerator(
+          *parameter,
+          [this, input = inputs[i], parameter](llvm_ir::IrArray::Index index) {
+            return input.EmitReadArrayElement(index, &b_, parameter->name());
+          });
+    }
+    TF_ASSIGN_OR_RETURN(
+        llvm_ir::ElementGenerator data_generator,
+        warp_row_reduction_emitter.GetGenerator(*match->data));
+
+    llvm::Type* f32_type = llvm_ir::PrimitiveTypeToIrType(F32, module_);
+    llvm::Type* shared_partials_type =
+        llvm::ArrayType::get(f32_type, warps_per_block);
+    llvm::GlobalVariable* shared_partials =
+        llvm_ir::AllocateSharedMemoryTile(
+            module_, shared_partials_type,
+            "musa_warp_row_reduction_shared_partials");
+    llvm::Value* thread = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kThreadIdx, {}, {}, &b_);
+    llvm::Value* row = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kBlockIdx, {}, {}, &b_);
+    llvm::Value* warp_size_value =
+        llvm::ConstantInt::get(thread->getType(), warp_size);
+    llvm::Value* warp_id = b_.CreateUDiv(thread, warp_size_value);
+    llvm::Value* lane_id = b_.CreateURem(thread, warp_size_value);
+    llvm::Value* lane_is_first = b_.CreateICmpEQ(
+        lane_id, llvm::ConstantInt::get(lane_id->getType(), 0));
+    llvm::Value* is_first_warp = b_.CreateICmpEQ(
+        warp_id, llvm::ConstantInt::get(warp_id->getType(), 0));
+    llvm::Value* thread_is_zero = b_.CreateICmpEQ(
+        thread, llvm::ConstantInt::get(thread->getType(), 0));
+    llvm::Constant* identity = llvm::ConstantFP::get(
+        f32_type, match->kind == MusaWarpRowReductionKind::kMultiply ? 1.0
+                                                                    : 0.0);
+    auto combine = [&](llvm::Value* lhs, llvm::Value* rhs) -> llvm::Value* {
+      if (match->kind == MusaWarpRowReductionKind::kAdd) {
+        return b_.CreateFAdd(lhs, rhs);
+      }
+      return b_.CreateFMul(lhs, rhs);
+    };
+    auto shared_partial_address = [&](llvm::Value* index) -> llvm::Value* {
+      return b_.CreateInBoundsGEP(
+          shared_partials_type, shared_partials,
+          {llvm::ConstantInt::get(index->getType(), 0), index});
+    };
+    KernelSupportLibrary ksl(&b_);
+
+    llvm_ir::IrArray::Index output_index(row, match->reduce->shape(), &b_);
+    llvm::Value* lane_value_address = llvm_ir::EmitAllocaAtFunctionEntry(
+        f32_type, "musa_warp_row_reduction_lane_value", &b_);
+    b_.CreateStore(identity, lane_value_address);
+    TF_RETURN_IF_ERROR(ksl.ForWithStatus(
+        "musa_warp_row_reduction_columns",
+        /*start=*/thread,
+        /*end=*/llvm::ConstantInt::get(thread->getType(), match->width),
+        /*step=*/llvm::ConstantInt::get(thread->getType(), threads_per_block),
+        [&](llvm::Value* column) -> Status {
+          std::vector<llvm::Value*> data_multi(
+              output_index.multidim().begin(), output_index.multidim().end());
+          data_multi.push_back(column);
+          llvm_ir::IrArray::Index data_index(
+              absl::MakeSpan(data_multi), match->data->shape(),
+              output_index.GetType());
+          TF_ASSIGN_OR_RETURN(llvm::Value * data_value,
+                              data_generator(data_index));
+          llvm::Value* accumulated =
+              b_.CreateLoad(f32_type, lane_value_address);
+          b_.CreateStore(combine(accumulated, data_value), lane_value_address);
+          return OkStatus();
+        }));
+
+    llvm::Value* value = b_.CreateLoad(f32_type, lane_value_address);
+    for (int64_t distance = warp_size / 2; distance > 0; distance /= 2) {
+      value = combine(value, EmitFullWarpShuffleDown(
+                                 value, b_.getInt32(distance), &b_, warp_size));
+    }
+    ksl.If("musa_warp_row_reduction_store_partial", lane_is_first, [&]() {
+      b_.CreateStore(value, shared_partial_address(warp_id));
+    });
+    EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {}, {}, &b_);
+
+    TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+        "musa_warp_row_reduction_finish", is_first_warp, [&]() -> Status {
+          llvm::Value* block_value_address =
+              llvm_ir::EmitAllocaAtFunctionEntry(
+                  f32_type, "musa_warp_row_reduction_block_value", &b_);
+          b_.CreateStore(identity, block_value_address);
+          llvm::Value* partial_exists = b_.CreateICmpULT(
+              lane_id,
+              llvm::ConstantInt::get(lane_id->getType(), warps_per_block));
+          TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+              "musa_warp_row_reduction_load_partial", partial_exists,
+              [&]() -> Status {
+                b_.CreateStore(
+                    b_.CreateLoad(f32_type,
+                                  shared_partial_address(lane_id)),
+                    block_value_address);
+                return OkStatus();
+              }));
+          llvm::Value* block_value =
+              b_.CreateLoad(f32_type, block_value_address);
+          for (int64_t distance = warp_size / 2; distance > 0;
+               distance /= 2) {
+            block_value = combine(
+                block_value,
+                EmitFullWarpShuffleDown(block_value, b_.getInt32(distance),
+                                        &b_, warp_size));
+          }
+          ksl.If("musa_warp_row_reduction_write", thread_is_zero, [&]() {
+            outputs[0].EmitWriteArrayElement(output_index, block_value, &b_);
+          });
+          return OkStatus();
+        }));
+    return OkStatus();
+  };
+
+  TF_ASSIGN_OR_RETURN(
+      auto thunk,
+      BuildKernelThunkForFusion(
+          *ir_emitter_context_, kernel_reuse_cache_, fusion_op,
+          fused_computation, launch_dimensions,
+          /*discriminator=*/"musa_warp_row_reduction", builder_fn, &b_));
+  AddThunkToThunkSequence(std::move(thunk));
+
+  const char* reducer =
+      match->kind == MusaWarpRowReductionKind::kAdd ? "add" : "multiply";
+  LOG(INFO) << "[MUSA_WARP_ROW_REDUCTION_KERNEL] fusion=" << fusion->name()
+            << " reducer=" << reducer
+            << " output_shape="
+            << ShapeUtil::HumanString(match->reduce->shape())
+            << " rows=" << match->rows << " width=" << match->width
+            << " data_elements=" << data_elements
+             << " min_data_elements=" << min_data_elements
+             << " requested_threads_per_block="
+             << requested_threads_per_block
+             << " warps_per_block=" << warps_per_block
+             << " threads_per_block=" << threads_per_block
+             << " elements_per_thread="
+             << launch_config->elements_per_thread
+             << " launch=" << launch_dimensions.ToString();
+  return true;
+}
+
+StatusOr<bool> IrEmitterUnnested::TryEmitMusaMixedTupleWarpRowReductionFusion(
+    mlir::lmhlo::FusionOp fusion_op,
+    const HloFusionInstruction* fusion) {
+  if (!MusaEnvExplicitlyTrue(
+          "MUSA_XLA_MIXED_TUPLE_WARP_ROW_REDUCTION_KERNEL")) {
+    return false;
+  }
+  const HloComputation* fused_computation =
+      fusion->fused_instructions_computation();
+  const bool match_diagnostics = MusaEnvExplicitlyTrue(
+      "MUSA_XLA_MIXED_TUPLE_WARP_ROW_REDUCTION_MATCH_DIAGNOSTICS");
+  std::string match_failure_reason;
+  std::optional<MusaMixedTupleWarpRowReductionMatch> match =
+      MatchMusaMixedTupleWarpRowReductionFusion(
+          fusion, fused_computation,
+          match_diagnostics ? &match_failure_reason : nullptr);
+  if (!match.has_value()) {
+    const HloInstruction* root = fused_computation->root_instruction();
+    if (match_diagnostics && root != nullptr &&
+        root->opcode() == HloOpcode::kTuple && root->operand_count() >= 3 &&
+        root->operand_count() <= 16) {
+      int64_t direct_reductions = 0;
+      std::vector<std::string> output_summaries;
+      output_summaries.reserve(root->operand_count());
+      for (int64_t index = 0; index < root->operand_count(); ++index) {
+        const HloInstruction* output = root->operand(index);
+        if (output->opcode() == HloOpcode::kReduce) {
+          ++direct_reductions;
+        }
+        output_summaries.push_back(absl::StrCat(
+            index, ":", HloOpcodeString(output->opcode()), ":",
+            ShapeUtil::HumanString(output->shape()), ":elementwise=",
+            output->IsElementwise() ? 1 : 0));
+      }
+      if (direct_reductions >= 2) {
+        LOG(INFO) << "[MUSA_MIXED_TUPLE_WARP_ROW_REDUCTION_MATCH] fusion="
+                  << fusion->name() << " matched=0 reason="
+                  << match_failure_reason
+                  << " root_shape=" << ShapeUtil::HumanString(root->shape())
+                  << " outputs=" << root->operand_count()
+                  << " direct_reductions=" << direct_reductions
+                  << " output_summary="
+                  << absl::StrJoin(output_summaries, "|");
+      }
+    }
+    return false;
+  }
+  for (const MusaIndexedWarpRowReductionMatch& indexed : match->reductions) {
+    if (!MusaWarpRowReductionReducerAllowed(indexed.reduction.kind)) {
+      return false;
+    }
+  }
+  const int64_t data_elements = match->rows * match->width;
+  const int64_t min_data_elements =
+      MusaMixedTupleWarpRowReductionMinDataElements();
+  if (data_elements < min_data_elements) {
+    return false;
+  }
+
+  const int64_t warp_size =
+      WarpSize(ir_emitter_context_->gpu_device_info());
+  if (warp_size <= 0 || (warp_size & (warp_size - 1)) != 0) {
+    return false;
+  }
+  const int64_t inherited_threads_per_block =
+      MusaWarpRowReductionThreadsPerBlock();
+  const int64_t small_width_max =
+      MusaMixedTupleWarpRowReductionSmallWidthMax();
+  const int64_t small_width_threads_per_block =
+      MusaMixedTupleWarpRowReductionSmallWidthThreadsPerBlock();
+  const bool small_width_override =
+      small_width_max > 0 && match->width <= small_width_max &&
+      small_width_threads_per_block > 0;
+  const int64_t requested_threads_per_block =
+      small_width_override ? small_width_threads_per_block
+                           : inherited_threads_per_block;
+  std::optional<MusaWarpRowReductionLaunchConfig> launch_config =
+      ResolveMusaWarpRowReductionLaunchConfig(
+          match->width, warp_size,
+          ir_emitter_context_->gpu_device_info().threads_per_block_limit(),
+          requested_threads_per_block);
+  if (!launch_config.has_value()) {
+    return false;
+  }
+  const int64_t warps_per_block = launch_config->warps_per_block;
+  const int64_t threads_per_block = launch_config->threads_per_block;
+  LaunchDimensions launch_dimensions(
+      LaunchDimensions::Dim3D{match->rows, 1, 1},
+      LaunchDimensions::Dim3D{threads_per_block, 1, 1});
+
+  auto builder_fn = [&, this](std::vector<llvm_ir::IrArray> inputs,
+                               std::vector<llvm_ir::IrArray> outputs) -> Status {
+    TF_RET_CHECK(inputs.size() == fused_computation->num_parameters());
+    TF_RET_CHECK(outputs.size() ==
+                 fused_computation->root_instruction()->operand_count());
+
+    FusedIrEmitter mixed_tuple_emitter(elemental_emitter_);
+    for (int64_t i = 0; i < fused_computation->num_parameters(); ++i) {
+      const HloInstruction* parameter =
+          fused_computation->parameter_instruction(i);
+      mixed_tuple_emitter.BindGenerator(
+          *parameter,
+          [this, input = inputs[i], parameter](llvm_ir::IrArray::Index index) {
+            return input.EmitReadArrayElement(index, &b_, parameter->name());
+          });
+    }
+
+    struct ElementwiseGenerator {
+      const MusaTupleElementwiseOutputMatch* output;
+      llvm_ir::ElementGenerator generator;
+    };
+    std::vector<ElementwiseGenerator> elementwise_generators;
+    elementwise_generators.reserve(match->elementwise_outputs.size());
+    for (const MusaTupleElementwiseOutputMatch& elementwise :
+         match->elementwise_outputs) {
+      TF_ASSIGN_OR_RETURN(
+          llvm_ir::ElementGenerator generator,
+          mixed_tuple_emitter.GetGenerator(*elementwise.instruction));
+      elementwise_generators.push_back(
+          ElementwiseGenerator{&elementwise, std::move(generator)});
+    }
+
+    struct ReductionGenerator {
+      const MusaIndexedWarpRowReductionMatch* indexed;
+      llvm_ir::ElementGenerator generator;
+    };
+    std::vector<ReductionGenerator> reduction_generators;
+    reduction_generators.reserve(match->reductions.size());
+    for (const MusaIndexedWarpRowReductionMatch& indexed :
+         match->reductions) {
+      TF_ASSIGN_OR_RETURN(
+          llvm_ir::ElementGenerator generator,
+          mixed_tuple_emitter.GetGenerator(*indexed.reduction.data));
+      reduction_generators.push_back(
+          ReductionGenerator{&indexed, std::move(generator)});
+    }
+
+    llvm::Type* f32_type = llvm_ir::PrimitiveTypeToIrType(F32, module_);
+    llvm::Type* shared_partials_type =
+        llvm::ArrayType::get(f32_type, warps_per_block);
+    const int64_t reduction_count = reduction_generators.size();
+    std::vector<llvm::GlobalVariable*> shared_partials;
+    std::vector<llvm::Constant*> identities;
+    std::vector<llvm::Value*> lane_value_addresses;
+    shared_partials.reserve(reduction_count);
+    identities.reserve(reduction_count);
+    lane_value_addresses.reserve(reduction_count);
+    for (int64_t index = 0; index < reduction_count; ++index) {
+      const MusaWarpRowReductionMatch& reduction =
+          reduction_generators[index].indexed->reduction;
+      shared_partials.push_back(llvm_ir::AllocateSharedMemoryTile(
+          module_, shared_partials_type,
+          absl::StrCat(
+              "musa_mixed_tuple_warp_row_reduction_shared_partials_",
+              index)));
+      identities.push_back(llvm::ConstantFP::get(
+          f32_type,
+          reduction.kind == MusaWarpRowReductionKind::kMultiply ? 1.0
+                                                                : 0.0));
+      lane_value_addresses.push_back(llvm_ir::EmitAllocaAtFunctionEntry(
+          f32_type,
+          absl::StrCat("musa_mixed_tuple_warp_row_reduction_lane_value_",
+                       index),
+          &b_));
+      b_.CreateStore(identities.back(), lane_value_addresses.back());
+    }
+
+    llvm::Value* thread = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kThreadIdx, {}, {}, &b_);
+    llvm::Value* row = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kBlockIdx, {}, {}, &b_);
+    llvm::Value* warp_size_value =
+        llvm::ConstantInt::get(thread->getType(), warp_size);
+    llvm::Value* warp_id = b_.CreateUDiv(thread, warp_size_value);
+    llvm::Value* lane_id = b_.CreateURem(thread, warp_size_value);
+    llvm::Value* lane_is_first = b_.CreateICmpEQ(
+        lane_id, llvm::ConstantInt::get(lane_id->getType(), 0));
+    llvm::Value* is_first_warp = b_.CreateICmpEQ(
+        warp_id, llvm::ConstantInt::get(warp_id->getType(), 0));
+    llvm::Value* thread_is_zero = b_.CreateICmpEQ(
+        thread, llvm::ConstantInt::get(thread->getType(), 0));
+    KernelSupportLibrary ksl(&b_);
+    auto combine = [&](MusaWarpRowReductionKind kind, llvm::Value* lhs,
+                       llvm::Value* rhs) -> llvm::Value* {
+      if (kind == MusaWarpRowReductionKind::kAdd) {
+        return b_.CreateFAdd(lhs, rhs);
+      }
+      return b_.CreateFMul(lhs, rhs);
+    };
+
+    const MusaWarpRowReductionMatch& common_reduction =
+        reduction_generators.front().indexed->reduction;
+    TF_RETURN_IF_ERROR(ksl.ForWithStatus(
+        "musa_mixed_tuple_warp_row_reduction_columns",
+        /*start=*/thread,
+        /*end=*/llvm::ConstantInt::get(thread->getType(), match->width),
+        /*step=*/llvm::ConstantInt::get(thread->getType(), threads_per_block),
+        [&](llvm::Value* column) -> Status {
+          llvm_ir::IrArray::Index output_index(
+              row, common_reduction.reduce->shape(), &b_);
+          std::vector<llvm::Value*> data_multi(
+              output_index.multidim().begin(), output_index.multidim().end());
+          data_multi.push_back(column);
+          llvm_ir::IrArray::Index data_index(
+              absl::MakeSpan(data_multi), common_reduction.data->shape(),
+              output_index.GetType());
+          absl::flat_hash_map<const HloInstruction*, llvm::Value*>
+              column_values;
+
+          for (const ElementwiseGenerator& generated :
+               elementwise_generators) {
+            const MusaTupleElementwiseOutputMatch& elementwise =
+                *generated.output;
+            llvm::Value* value;
+            auto value_it = column_values.find(elementwise.instruction);
+            if (value_it == column_values.end()) {
+              TF_ASSIGN_OR_RETURN(value, generated.generator(data_index));
+              column_values.emplace(elementwise.instruction, value);
+            } else {
+              value = value_it->second;
+            }
+            outputs[elementwise.tuple_index].EmitWriteArrayElement(
+                data_index, value, &b_);
+          }
+
+          for (int64_t reduction_index = 0;
+               reduction_index < reduction_count; ++reduction_index) {
+            const ReductionGenerator& generated =
+                reduction_generators[reduction_index];
+            const MusaWarpRowReductionMatch& reduction =
+                generated.indexed->reduction;
+            llvm::Value* data_value;
+            auto value_it = column_values.find(reduction.data);
+            if (value_it == column_values.end()) {
+              TF_ASSIGN_OR_RETURN(data_value,
+                                  generated.generator(data_index));
+              column_values.emplace(reduction.data, data_value);
+            } else {
+              data_value = value_it->second;
+            }
+            llvm::Value* accumulated = b_.CreateLoad(
+                f32_type, lane_value_addresses[reduction_index]);
+            b_.CreateStore(combine(reduction.kind, accumulated, data_value),
+                           lane_value_addresses[reduction_index]);
+          }
+          return OkStatus();
+        }));
+
+    for (int64_t reduction_index = 0;
+         reduction_index < reduction_count; ++reduction_index) {
+      const MusaIndexedWarpRowReductionMatch& indexed =
+          *reduction_generators[reduction_index].indexed;
+      const MusaWarpRowReductionMatch& reduction = indexed.reduction;
+      llvm::Constant* identity = identities[reduction_index];
+      auto shared_partial_address = [&](llvm::Value* index) -> llvm::Value* {
+        return b_.CreateInBoundsGEP(
+            shared_partials_type, shared_partials[reduction_index],
+            {llvm::ConstantInt::get(index->getType(), 0), index});
+      };
+
+      llvm_ir::IrArray::Index output_index(row, reduction.reduce->shape(),
+                                            &b_);
+      llvm::Value* value = b_.CreateLoad(
+          f32_type, lane_value_addresses[reduction_index]);
+      for (int64_t distance = warp_size / 2; distance > 0; distance /= 2) {
+        value = combine(reduction.kind, value,
+                        EmitFullWarpShuffleDown(
+                            value, b_.getInt32(distance), &b_, warp_size));
+      }
+      ksl.If(
+          absl::StrCat(
+              "musa_mixed_tuple_warp_row_reduction_store_partial_",
+              reduction_index),
+          lane_is_first, [&]() {
+            b_.CreateStore(value, shared_partial_address(warp_id));
+          });
+      EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {}, {}, &b_);
+
+      TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+          absl::StrCat("musa_mixed_tuple_warp_row_reduction_finish_",
+                       reduction_index),
+          is_first_warp, [&]() -> Status {
+            llvm::Value* block_value_address =
+                llvm_ir::EmitAllocaAtFunctionEntry(
+                    f32_type,
+                    absl::StrCat(
+                        "musa_mixed_tuple_warp_row_reduction_block_value_",
+                        reduction_index),
+                    &b_);
+            b_.CreateStore(identity, block_value_address);
+            llvm::Value* partial_exists = b_.CreateICmpULT(
+                lane_id,
+                llvm::ConstantInt::get(lane_id->getType(),
+                                       warps_per_block));
+            TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                absl::StrCat(
+                    "musa_mixed_tuple_warp_row_reduction_load_partial_",
+                    reduction_index),
+                partial_exists, [&]() -> Status {
+                  b_.CreateStore(
+                      b_.CreateLoad(f32_type,
+                                    shared_partial_address(lane_id)),
+                      block_value_address);
+                  return OkStatus();
+                }));
+            llvm::Value* block_value =
+                b_.CreateLoad(f32_type, block_value_address);
+            for (int64_t distance = warp_size / 2; distance > 0;
+                 distance /= 2) {
+              block_value = combine(
+                  reduction.kind, block_value,
+                  EmitFullWarpShuffleDown(block_value, b_.getInt32(distance),
+                                          &b_, warp_size));
+            }
+            ksl.If(
+                absl::StrCat(
+                    "musa_mixed_tuple_warp_row_reduction_write_",
+                    reduction_index),
+                thread_is_zero, [&]() {
+                  outputs[indexed.tuple_index].EmitWriteArrayElement(
+                      output_index, block_value, &b_);
+                });
+            return OkStatus();
+          }));
+    }
+    return OkStatus();
+  };
+
+  TF_ASSIGN_OR_RETURN(
+      auto thunk,
+      BuildKernelThunkForFusion(
+          *ir_emitter_context_, kernel_reuse_cache_, fusion_op,
+          fused_computation, launch_dimensions,
+          /*discriminator=*/"musa_mixed_tuple_warp_row_reduction",
+          builder_fn, &b_));
+  AddThunkToThunkSequence(std::move(thunk));
+
+  std::vector<std::string> reducers;
+  std::vector<std::string> reduction_tuple_indices;
+  reducers.reserve(match->reductions.size());
+  reduction_tuple_indices.reserve(match->reductions.size());
+  for (const MusaIndexedWarpRowReductionMatch& indexed : match->reductions) {
+    reducers.push_back(
+        indexed.reduction.kind == MusaWarpRowReductionKind::kAdd
+            ? "add"
+            : "multiply");
+    reduction_tuple_indices.push_back(absl::StrCat(indexed.tuple_index));
+  }
+  std::vector<std::string> elementwise_tuple_indices;
+  elementwise_tuple_indices.reserve(match->elementwise_outputs.size());
+  for (const MusaTupleElementwiseOutputMatch& elementwise :
+       match->elementwise_outputs) {
+    elementwise_tuple_indices.push_back(
+        absl::StrCat(elementwise.tuple_index));
+  }
+  LOG(INFO) << "[MUSA_MIXED_TUPLE_WARP_ROW_REDUCTION_KERNEL] fusion="
+            << fusion->name() << " reducers=" << absl::StrJoin(reducers, ",")
+            << " reductions=" << match->reductions.size()
+            << " elementwise_outputs=" << match->elementwise_outputs.size()
+            << " reduction_tuple_indices="
+            << absl::StrJoin(reduction_tuple_indices, ",")
+            << " elementwise_tuple_indices="
+            << absl::StrJoin(elementwise_tuple_indices, ",")
+            << " rows=" << match->rows << " width=" << match->width
+            << " data_elements=" << data_elements
+            << " min_data_elements=" << min_data_elements
+            << " small_width_max=" << small_width_max
+            << " small_width_threads_per_block="
+            << small_width_threads_per_block
+            << " small_width_override=" << (small_width_override ? 1 : 0)
+            << " requested_threads_per_block="
+            << requested_threads_per_block
+            << " warps_per_block=" << warps_per_block
+            << " threads_per_block=" << threads_per_block
+            << " elements_per_thread=" << launch_config->elements_per_thread
+            << " launch=" << launch_dimensions.ToString();
+  return true;
+}
+
+StatusOr<bool> IrEmitterUnnested::TryEmitMusaTupleWarpRowReductionFusion(
+    mlir::lmhlo::FusionOp fusion_op,
+    const HloFusionInstruction* fusion) {
+  if (!MusaEnvExplicitlyTrue(
+          "MUSA_XLA_TUPLE_WARP_ROW_REDUCTION_KERNEL")) {
+    return false;
+  }
+  const HloComputation* fused_computation =
+      fusion->fused_instructions_computation();
+  std::optional<MusaTupleWarpRowReductionMatch> match =
+      MatchMusaTupleWarpRowReductionFusion(fusion, fused_computation);
+  if (!match.has_value()) {
+    return false;
+  }
+  for (const MusaWarpRowReductionMatch& reduction : match->reductions) {
+    if (!MusaWarpRowReductionReducerAllowed(reduction.kind)) {
+      return false;
+    }
+  }
+  const int64_t data_elements = match->rows * match->width;
+  const int64_t min_data_elements =
+      MusaWarpRowReductionMinDataElements();
+  if (data_elements < min_data_elements) {
+    return false;
+  }
+
+  const int64_t warp_size =
+      WarpSize(ir_emitter_context_->gpu_device_info());
+  if (warp_size <= 0 || (warp_size & (warp_size - 1)) != 0) {
+    return false;
+  }
+  const int64_t requested_threads_per_block =
+      MusaWarpRowReductionThreadsPerBlock();
+  std::optional<MusaWarpRowReductionLaunchConfig> launch_config =
+      ResolveMusaWarpRowReductionLaunchConfig(
+          match->width, warp_size,
+          ir_emitter_context_->gpu_device_info().threads_per_block_limit(),
+          requested_threads_per_block);
+  if (!launch_config.has_value()) {
+    return false;
+  }
+  const int64_t warps_per_block = launch_config->warps_per_block;
+  const int64_t threads_per_block = launch_config->threads_per_block;
+  LaunchDimensions launch_dimensions(
+      LaunchDimensions::Dim3D{match->rows, 1, 1},
+      LaunchDimensions::Dim3D{threads_per_block, 1, 1});
+
+  auto builder_fn = [&, this](std::vector<llvm_ir::IrArray> inputs,
+                               std::vector<llvm_ir::IrArray> outputs) -> Status {
+    TF_RET_CHECK(inputs.size() == fused_computation->num_parameters());
+    TF_RET_CHECK(outputs.size() == match->reductions.size());
+
+    FusedIrEmitter tuple_reduction_emitter(elemental_emitter_);
+    for (int64_t i = 0; i < fused_computation->num_parameters(); ++i) {
+      const HloInstruction* parameter =
+          fused_computation->parameter_instruction(i);
+      tuple_reduction_emitter.BindGenerator(
+          *parameter,
+          [this, input = inputs[i], parameter](llvm_ir::IrArray::Index index) {
+            return input.EmitReadArrayElement(index, &b_, parameter->name());
+          });
+    }
+    std::vector<llvm_ir::ElementGenerator> data_generators;
+    data_generators.reserve(match->reductions.size());
+    for (const MusaWarpRowReductionMatch& reduction : match->reductions) {
+      TF_ASSIGN_OR_RETURN(llvm_ir::ElementGenerator generator,
+                          tuple_reduction_emitter.GetGenerator(
+                              *reduction.data));
+      data_generators.push_back(std::move(generator));
+    }
+
+    llvm::Type* f32_type = llvm_ir::PrimitiveTypeToIrType(F32, module_);
+    llvm::Type* shared_partials_type =
+        llvm::ArrayType::get(f32_type, warps_per_block);
+    const int64_t reduction_count = match->reductions.size();
+    std::vector<llvm::GlobalVariable*> shared_partials;
+    std::vector<llvm::Constant*> identities;
+    std::vector<llvm::Value*> lane_value_addresses;
+    shared_partials.reserve(reduction_count);
+    identities.reserve(reduction_count);
+    lane_value_addresses.reserve(reduction_count);
+    for (int64_t index = 0; index < reduction_count; ++index) {
+      shared_partials.push_back(llvm_ir::AllocateSharedMemoryTile(
+          module_, shared_partials_type,
+          absl::StrCat("musa_tuple_warp_row_reduction_shared_partials_",
+                       index)));
+      identities.push_back(llvm::ConstantFP::get(
+          f32_type,
+          match->reductions[index].kind == MusaWarpRowReductionKind::kMultiply
+              ? 1.0
+              : 0.0));
+      lane_value_addresses.push_back(llvm_ir::EmitAllocaAtFunctionEntry(
+          f32_type,
+          absl::StrCat("musa_tuple_warp_row_reduction_lane_value_", index),
+          &b_));
+      b_.CreateStore(identities.back(), lane_value_addresses.back());
+    }
+
+    llvm::Value* thread = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kThreadIdx, {}, {}, &b_);
+    llvm::Value* row = EmitCallToTargetIntrinsic(
+        TargetIntrinsicID::kBlockIdx, {}, {}, &b_);
+    llvm::Value* warp_size_value =
+        llvm::ConstantInt::get(thread->getType(), warp_size);
+    llvm::Value* warp_id = b_.CreateUDiv(thread, warp_size_value);
+    llvm::Value* lane_id = b_.CreateURem(thread, warp_size_value);
+    llvm::Value* lane_is_first = b_.CreateICmpEQ(
+        lane_id, llvm::ConstantInt::get(lane_id->getType(), 0));
+    llvm::Value* is_first_warp = b_.CreateICmpEQ(
+        warp_id, llvm::ConstantInt::get(warp_id->getType(), 0));
+    llvm::Value* thread_is_zero = b_.CreateICmpEQ(
+        thread, llvm::ConstantInt::get(thread->getType(), 0));
+    KernelSupportLibrary ksl(&b_);
+    auto combine = [&](MusaWarpRowReductionKind kind, llvm::Value* lhs,
+                       llvm::Value* rhs) -> llvm::Value* {
+      if (kind == MusaWarpRowReductionKind::kAdd) {
+        return b_.CreateFAdd(lhs, rhs);
+      }
+      return b_.CreateFMul(lhs, rhs);
+    };
+
+    TF_RETURN_IF_ERROR(ksl.ForWithStatus(
+        "musa_tuple_warp_row_reduction_columns",
+        /*start=*/thread,
+        /*end=*/llvm::ConstantInt::get(thread->getType(), match->width),
+        /*step=*/llvm::ConstantInt::get(thread->getType(), threads_per_block),
+        [&](llvm::Value* column) -> Status {
+          for (int64_t reduction_index = 0;
+               reduction_index < reduction_count; ++reduction_index) {
+            const MusaWarpRowReductionMatch& reduction =
+                match->reductions[reduction_index];
+            llvm_ir::IrArray::Index output_index(
+                row, reduction.reduce->shape(), &b_);
+            std::vector<llvm::Value*> data_multi(
+                output_index.multidim().begin(),
+                output_index.multidim().end());
+            data_multi.push_back(column);
+            llvm_ir::IrArray::Index data_index(
+                absl::MakeSpan(data_multi), reduction.data->shape(),
+                output_index.GetType());
+            TF_ASSIGN_OR_RETURN(
+                llvm::Value * data_value,
+                data_generators[reduction_index](data_index));
+            llvm::Value* accumulated = b_.CreateLoad(
+                f32_type, lane_value_addresses[reduction_index]);
+            b_.CreateStore(combine(reduction.kind, accumulated, data_value),
+                           lane_value_addresses[reduction_index]);
+          }
+          return OkStatus();
+        }));
+
+    for (int64_t reduction_index = 0; reduction_index < reduction_count;
+         ++reduction_index) {
+      const MusaWarpRowReductionMatch& reduction =
+          match->reductions[reduction_index];
+      llvm::Constant* identity = identities[reduction_index];
+      auto shared_partial_address = [&](llvm::Value* index) -> llvm::Value* {
+        return b_.CreateInBoundsGEP(
+            shared_partials_type, shared_partials[reduction_index],
+            {llvm::ConstantInt::get(index->getType(), 0), index});
+      };
+
+      llvm_ir::IrArray::Index output_index(row, reduction.reduce->shape(),
+                                            &b_);
+      llvm::Value* value = b_.CreateLoad(
+          f32_type, lane_value_addresses[reduction_index]);
+      for (int64_t distance = warp_size / 2; distance > 0; distance /= 2) {
+        value = combine(reduction.kind, value,
+                        EmitFullWarpShuffleDown(
+                            value, b_.getInt32(distance), &b_, warp_size));
+      }
+      ksl.If(
+          absl::StrCat("musa_tuple_warp_row_reduction_store_partial_",
+                       reduction_index),
+          lane_is_first, [&]() {
+            b_.CreateStore(value, shared_partial_address(warp_id));
+          });
+      EmitCallToTargetIntrinsic(TargetIntrinsicID::kBarrierId, {}, {}, &b_);
+
+      TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+          absl::StrCat("musa_tuple_warp_row_reduction_finish_",
+                       reduction_index),
+          is_first_warp, [&]() -> Status {
+            llvm::Value* block_value_address =
+                llvm_ir::EmitAllocaAtFunctionEntry(
+                    f32_type,
+                    absl::StrCat(
+                        "musa_tuple_warp_row_reduction_block_value_",
+                        reduction_index),
+                    &b_);
+            b_.CreateStore(identity, block_value_address);
+            llvm::Value* partial_exists = b_.CreateICmpULT(
+                lane_id,
+                llvm::ConstantInt::get(lane_id->getType(),
+                                       warps_per_block));
+            TF_RETURN_IF_ERROR(ksl.IfWithStatus(
+                absl::StrCat(
+                    "musa_tuple_warp_row_reduction_load_partial_",
+                    reduction_index),
+                partial_exists, [&]() -> Status {
+                  b_.CreateStore(
+                      b_.CreateLoad(f32_type,
+                                    shared_partial_address(lane_id)),
+                      block_value_address);
+                  return OkStatus();
+                }));
+            llvm::Value* block_value =
+                b_.CreateLoad(f32_type, block_value_address);
+            for (int64_t distance = warp_size / 2; distance > 0;
+                 distance /= 2) {
+              block_value = combine(
+                  reduction.kind, block_value,
+                  EmitFullWarpShuffleDown(block_value, b_.getInt32(distance),
+                                          &b_, warp_size));
+            }
+            ksl.If(
+                absl::StrCat("musa_tuple_warp_row_reduction_write_",
+                             reduction_index),
+                thread_is_zero, [&]() {
+                  outputs[reduction_index].EmitWriteArrayElement(
+                      output_index, block_value, &b_);
+                });
+            return OkStatus();
+          }));
+    }
+    return OkStatus();
+  };
+
+  TF_ASSIGN_OR_RETURN(
+      auto thunk,
+      BuildKernelThunkForFusion(
+          *ir_emitter_context_, kernel_reuse_cache_, fusion_op,
+          fused_computation, launch_dimensions,
+          /*discriminator=*/"musa_tuple_warp_row_reduction", builder_fn,
+          &b_));
+  AddThunkToThunkSequence(std::move(thunk));
+
+  std::vector<std::string> reducers;
+  reducers.reserve(match->reductions.size());
+  for (const MusaWarpRowReductionMatch& reduction : match->reductions) {
+    reducers.push_back(reduction.kind == MusaWarpRowReductionKind::kAdd
+                           ? "add"
+                           : "multiply");
+  }
+  return true;
+}
+
 Status IrEmitterUnnested::EmitFusion(
     mlir::Operation* op,
     const absl::flat_hash_map<const mlir::Operation*, const HloInstruction*>&
@@ -1793,6 +3637,41 @@ Status IrEmitterUnnested::EmitFusion(
   }
 
   auto* fused_computation = fusion->fused_instructions_computation();
+
+  TF_ASSIGN_OR_RETURN(
+      bool hot_tuple_softmax_emitted,
+      TryEmitMusaHotTupleSoftmaxFusion(fusion_op, fusion));
+  if (hot_tuple_softmax_emitted) {
+    return OkStatus();
+  }
+
+  TF_ASSIGN_OR_RETURN(
+      bool reduction_chain_emitted,
+      TryEmitMusaReductionChainFusion(fusion_op, fusion));
+  if (reduction_chain_emitted) {
+    return OkStatus();
+  }
+
+  TF_ASSIGN_OR_RETURN(
+      bool mixed_tuple_warp_row_reduction_emitted,
+      TryEmitMusaMixedTupleWarpRowReductionFusion(fusion_op, fusion));
+  if (mixed_tuple_warp_row_reduction_emitted) {
+    return OkStatus();
+  }
+
+  TF_ASSIGN_OR_RETURN(
+      bool tuple_warp_row_reduction_emitted,
+      TryEmitMusaTupleWarpRowReductionFusion(fusion_op, fusion));
+  if (tuple_warp_row_reduction_emitted) {
+    return OkStatus();
+  }
+
+  TF_ASSIGN_OR_RETURN(
+      bool warp_row_reduction_emitted,
+      TryEmitMusaWarpRowReductionFusion(fusion_op, fusion));
+  if (warp_row_reduction_emitted) {
+    return OkStatus();
+  }
 
   // Create HloFusionAnalysis instance.
   const se::DeviceDescription& device_info =
@@ -3011,6 +4890,18 @@ Status IrEmitterUnnested::EmitOp(
   }
 
   if (auto call = mlir::dyn_cast<mlir::lmhlo::CustomCallOp>(op)) {
+    if (call.getCallTargetName() == kMusaGemmBetaChainCustomCallTarget) {
+      return EmitMusaGemmBetaChainThunk(op);
+    }
+    if (call.getCallTargetName() == kMusaGemmEpilogueCustomCallTarget) {
+      return EmitMusaGemmEpilogueThunk(op);
+    }
+    if (call.getCallTargetName() == kMusaPointerArrayGemmCustomCallTarget) {
+      return EmitMusaPointerArrayGemmThunk(op);
+    }
+    if (call.getCallTargetName() == kMusaSmallKDotCustomCallTarget) {
+      return EmitMusaSmallKDotThunk(op);
+    }
     if (call.getCallTargetName() == "PadToStatic") {
       return EmitPadToStatic(op);
     }

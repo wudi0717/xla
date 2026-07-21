@@ -31,6 +31,7 @@ limitations under the License.
 #include "xla/shape_util.h"
 #include "xla/util.h"
 #include "tsl/platform/errors.h"
+#include "tsl/platform/logging.h"
 
 namespace xla {
 namespace gpu {
@@ -41,10 +42,12 @@ class FusionInstructionMerger {
  public:
   explicit FusionInstructionMerger(
       HloComputation* computation, const se::DeviceDescription& gpu_device_info,
-      HloCostAnalysis::ShapeSizeFunction shape_size_function)
+      HloCostAnalysis::ShapeSizeFunction shape_size_function,
+      FusionMergerOptions options)
       : computation_(computation),
         shape_size_function_(shape_size_function),
         gpu_device_info_(gpu_device_info),
+        options_(options),
         dump_fusion_visualization_(computation->parent()
                                        ->config()
                                        .debug_options()
@@ -65,6 +68,7 @@ class FusionInstructionMerger {
   std::optional<GpuHloCostAnalysis> cost_analysis_;
   FusionInfoCache fusion_info_cache_;
   const se::DeviceDescription& gpu_device_info_;
+  FusionMergerOptions options_;
   bool changed_ = false;
   bool dump_fusion_visualization_ = false;
 
@@ -78,6 +82,7 @@ class FusionInstructionMerger {
   int num_fail_fusion_too_large_ = 0;
   int num_fail_uncoalesced_read_ = 0;
   int num_fail_slower_if_fused_ = 0;
+  int num_fail_materialized_reduction_producer_ = 0;
 
   FusionInstructionMerger(const FusionInstructionMerger&) = delete;
   FusionInstructionMerger& operator=(const FusionInstructionMerger&) = delete;
@@ -170,6 +175,8 @@ Status FusionInstructionMerger::Run() {
           << " inefficient_fusion_emitter: "
           << num_fail_inefficient_fusion_emitter_
           << " slower_if_fused: " << num_fail_slower_if_fused_
+          << " materialized_reduction_producer: "
+          << num_fail_materialized_reduction_producer_
           << " fusion_too_large: " << num_fail_fusion_too_large_ << " }";
   return OkStatus();
 }
@@ -237,6 +244,27 @@ FusionDecision FusionInstructionMerger::ShouldFuse(HloInstruction* producer) {
     }
   }
 
+  if (options_.materialize_large_multi_user_reduction_producer &&
+      producer->user_count() >= 2 && has_reduction_user &&
+      producer->shape().IsArray() &&
+      ShapeUtil::ElementsIn(producer->shape()) >=
+          options_.min_materialized_producer_elements &&
+      producer->operand_count() >=
+          options_.min_materialized_producer_operands) {
+    ++num_fail_materialized_reduction_producer_;
+    if (options_.log_materialized_reduction_producers) {
+      LOG(INFO) << "[MUSA_FUSION_MERGER_MATERIALIZE] module="
+                << computation_->parent()->name()
+                << " computation=" << computation_->name()
+                << " producer=" << producer->name()
+                << " shape=" << ShapeUtil::HumanString(producer->shape())
+                << " elements=" << ShapeUtil::ElementsIn(producer->shape())
+                << " operands=" << producer->operand_count()
+                << " reduction_users=" << producer->user_count();
+    }
+    return "materializing large multi-user reduction producer";
+  }
+
   // We do not want to worsen reduction's memory access pattern by connecting
   // it to a producer which transposes most data.
   if (has_reduction_user && TransposesMostData(*producer)) {
@@ -295,8 +323,8 @@ StatusOr<bool> FusionMerger::Run(
             << computation->name();
     XLA_VLOG_LINES(9, computation->ToString());
 
-    FusionInstructionMerger fusion_merger(computation, gpu_device_info_,
-                                          shape_size_function_);
+    FusionInstructionMerger fusion_merger(
+        computation, gpu_device_info_, shape_size_function_, options_);
     TF_RETURN_IF_ERROR(fusion_merger.Run());
     changed |= fusion_merger.changed();
 

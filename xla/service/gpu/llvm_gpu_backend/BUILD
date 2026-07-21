@@ -100,6 +100,7 @@ xla_cc_test(
         ":mtgpu_backend",
         "//xla:test",
         "//xla/tests:xla_internal_test_main",
+        "@llvm-project//llvm:Core",
     ],
 )
 

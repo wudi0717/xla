@@ -124,7 +124,10 @@ cc_library(
     hdrs = ["custom_call_thunk.h"],
     local_defines = if_cuda_is_configured([
         "GOOGLE_CUDA=1",
-    ]),
+    ]) + select({
+        "//xla/service:using_musa_mcc": ["TENSORFLOW_USE_MUSA=1"],
+        "//conditions:default": [],
+    }),
     visibility = ["//visibility:public"],
     deps = [
         ":buffer_allocations",
@@ -295,6 +298,13 @@ cc_library(
         ":kernel_reuse_cache",
         ":launch_dimensions",
         ":matmul_utils",
+        ":musa_fusion_custom_calls",
+        ":musa_hot_tuple_softmax",
+        ":musa_reduction_chain",
+        ":musa_warp_row_reduction",
+        ":musa_gemm_beta_chain_thunk",
+        ":musa_gemm_epilogue_thunk",
+        ":musa_grouped_gemm_thunk",
         ":nccl_collective_thunks",
         ":parallel_loop_emitter",
         ":reduction_utils",
@@ -753,6 +763,7 @@ cc_library(
         "//xla/stream_executor",
         "//xla/translate/mhlo_to_hlo:location_exporter",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
         "@llvm-project//mlir:IR",
         "@local_tsl//tsl/platform:status",
     ],
@@ -951,6 +962,8 @@ cc_library(
         ":kernel_arguments",
         ":launch_dimensions",
         ":matmul_utils",
+        ":musa_grouped_gemm_thunk",
+        ":musa_small_gemm_accum_thunk",
         ":nccl_collective_thunks",
         ":non_atomically_upgradeable_rw_lock",
         ":stream_executor_util",
@@ -986,6 +999,7 @@ cc_library(
         "//xla/service/gpu/runtime2:executable",
         "//xla/stream_executor",
         "//xla/stream_executor:blas",
+        "//xla/stream_executor:command_buffer",
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:device_memory",
         "//xla/stream_executor:device_memory_allocator",
@@ -1015,6 +1029,7 @@ cc_library(
         "@llvm-project//mlir:IR",
         "@llvm-project//mlir:Parser",
         "@llvm-project//mlir:Support",
+        "@local_tsl//tsl/platform:env",
         "@local_tsl//tsl/platform:errors",
         "@local_tsl//tsl/platform:logging",
         "@local_tsl//tsl/platform:random",
@@ -1183,6 +1198,7 @@ cc_library(
         "//xla:xla_data_proto_cc",
         "//xla/hlo/evaluator:hlo_evaluator",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/ir:hlo_reachability",
         "//xla/service:hlo_creation_utils",
         "//xla/service:hlo_pass",
         "//xla/service:pattern_matcher",
@@ -1197,6 +1213,190 @@ cc_library(
     ] + if_cuda_is_configured([
         "@local_config_cuda//cuda:cuda_headers",
     ]),
+)
+
+cc_library(
+    name = "musa_fusion_custom_calls",
+    hdrs = ["musa_fusion_custom_calls.h"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "musa_hot_tuple_softmax",
+    srcs = ["musa_hot_tuple_softmax.cc"],
+    hdrs = ["musa_hot_tuple_softmax.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla/hlo/ir:hlo",
+    ],
+)
+
+cc_library(
+    name = "musa_warp_row_reduction",
+    srcs = ["musa_warp_row_reduction.cc"],
+    hdrs = ["musa_warp_row_reduction.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+    ],
+)
+
+cc_library(
+    name = "musa_reduction_chain",
+    srcs = ["musa_reduction_chain.cc"],
+    hdrs = ["musa_reduction_chain.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//xla:shape_util",
+        "//xla/hlo/ir:hlo",
+        "@com_google_absl//absl/container:flat_hash_set",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_reduction_chain_test",
+    srcs = ["musa_reduction_chain_test.cc"],
+    deps = [
+        ":musa_reduction_chain",
+        "//xla/hlo/ir:hlo",
+        "//xla/tests:hlo_test_base",
+        "//xla/tests:xla_internal_test_main",
+        "@local_tsl//tsl/lib/core:status_test_util",
+        "@local_tsl//tsl/platform:test",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_warp_row_reduction_test",
+    srcs = ["musa_warp_row_reduction_test.cc"],
+    deps = [
+        ":musa_warp_row_reduction",
+        "//xla/hlo/ir:hlo",
+        "//xla/tests:hlo_test_base",
+        "//xla/tests:xla_internal_test_main",
+        "@local_tsl//tsl/lib/core:status_test_util",
+        "@local_tsl//tsl/platform:test",
+    ],
+)
+
+cc_library(
+    name = "musa_gemm_epilogue_fusion",
+    srcs = ["musa_gemm_epilogue_fusion.cc"],
+    hdrs = ["musa_gemm_epilogue_fusion.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":backend_configs_cc",
+        ":cublas_cudnn",
+        ":musa_fusion_custom_calls",
+        "//xla:status",
+        "//xla:status_macros",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_dce",
+        "//xla/service:hlo_pass",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@local_tsl//tsl/platform:statusor",
+    ],
+)
+
+cc_library(
+    name = "musa_dot_epilogue_fusion",
+    srcs = ["musa_dot_epilogue_fusion.cc"],
+    hdrs = ["musa_dot_epilogue_fusion.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":backend_configs_cc",
+        ":ir_emission_utils",
+        "//xla:status",
+        "//xla:status_macros",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_dce",
+        "//xla/service:hlo_pass",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@local_tsl//tsl/platform:statusor",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_gemm_epilogue_fusion_test",
+    srcs = ["musa_gemm_epilogue_fusion_test.cc"],
+    deps = [
+        ":backend_configs_cc",
+        ":gemm_rewriter",
+        ":musa_gemm_epilogue_fusion",
+        ":musa_fusion_custom_calls",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_module_config",
+        "//xla/stream_executor:device_description",
+        "//xla/tests:hlo_test_base",
+        "//xla/tests:verified_hlo_module",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+        "@local_tsl//tsl/lib/core:status_test_util",
+        "@local_tsl//tsl/platform:statusor",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_dot_epilogue_fusion_test",
+    srcs = ["musa_dot_epilogue_fusion_test.cc"],
+    deps = [
+        ":backend_configs_cc",
+        ":musa_dot_epilogue_fusion",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_module_config",
+        "//xla/tests:hlo_test_base",
+        "//xla/tests:verified_hlo_module",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+        "@local_tsl//tsl/lib/core:status_test_util",
+        "@local_tsl//tsl/platform:statusor",
+    ],
+)
+
+cc_library(
+    name = "musa_gemm_beta_chain_merger",
+    srcs = ["musa_gemm_beta_chain_merger.cc"],
+    hdrs = ["musa_gemm_beta_chain_merger.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":backend_configs_cc",
+        ":cublas_cudnn",
+        "//xla:shape_util",
+        "//xla:status_macros",
+        "//xla:status",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:hlo_creation_utils",
+        "//xla/service:hlo_dce",
+        "//xla/service:hlo_pass",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/strings",
+        "@local_tsl//tsl/platform:statusor",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_gemm_beta_chain_merger_test",
+    srcs = ["musa_gemm_beta_chain_merger_test.cc"],
+    deps = [
+        ":gemm_rewriter",
+        ":musa_gemm_beta_chain_merger",
+        "//xla/hlo/ir:hlo",
+        "//xla/service:pattern_matcher",
+        "//xla/service:hlo_module_config",
+        "//xla/stream_executor:device_description",
+        "//xla/tests:hlo_test_base",
+        "//xla/tests:verified_hlo_module",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+        "@local_tsl//tsl/lib/core:status_test_util",
+        "@local_tsl//tsl/platform:statusor",
+    ],
 )
 
 cc_library(
@@ -1356,6 +1556,130 @@ cc_library(
         "//xla/service:buffer_assignment",
         "//xla/stream_executor",
         "//xla/stream_executor:device_memory",
+        "@local_tsl//tsl/platform:logging",
+    ],
+)
+
+cc_library(
+    name = "musa_gemm_beta_chain_thunk",
+    srcs = ["musa_gemm_beta_chain_thunk.cc"],
+    hdrs = ["musa_gemm_beta_chain_thunk.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":matmul_utils",
+        ":thunk",
+        "//xla:status",
+        "//xla:status_macros",
+        "//xla/service:buffer_assignment",
+        "//xla/stream_executor",
+        "//xla/stream_executor:device_memory",
+        "@com_google_absl//absl/strings",
+        "@local_tsl//tsl/platform:logging",
+    ],
+)
+
+cc_library(
+    name = "musa_grouped_gemm_thunk",
+    srcs = ["musa_grouped_gemm_thunk.cc"],
+    hdrs = ["musa_grouped_gemm_thunk.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":gemm_thunk",
+        ":matmul_utils",
+        ":thunk",
+        "//xla:shape_util",
+        "//xla:status",
+        "//xla:status_macros",
+        "//xla:statusor",
+        "//xla/service:buffer_assignment",
+        "//xla/stream_executor",
+        "//xla/stream_executor:device_memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:span",
+        "@local_tsl//tsl/platform:logging",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_small_gemm_accum_thunk_test",
+    srcs = ["musa_small_gemm_accum_thunk_test.cc"],
+    deps = [
+        ":gemm_thunk",
+        ":matmul_utils",
+        ":musa_small_gemm_accum_thunk",
+        ":thunk",
+        "//xla:statusor",
+        "//xla:types",
+        "//xla/service:buffer_assignment",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+        "@local_tsl//tsl/lib/core:status_test_util",
+    ],
+)
+
+cc_library(
+    name = "musa_small_gemm_accum_thunk",
+    srcs = ["musa_small_gemm_accum_thunk.cc"],
+    hdrs = ["musa_small_gemm_accum_thunk.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":gemm_thunk",
+        ":matmul_utils",
+        ":thunk",
+        "//xla:status",
+        "//xla:status_macros",
+        "//xla:statusor",
+        "//xla/service:buffer_assignment",
+        "//xla/stream_executor",
+        "//xla/stream_executor:device_memory",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@local_tsl//tsl/platform:logging",
+    ],
+)
+
+xla_cc_test(
+    name = "musa_grouped_gemm_thunk_test",
+    srcs = ["musa_grouped_gemm_thunk_test.cc"],
+    deps = [
+        ":gemm_thunk",
+        ":matmul_utils",
+        ":musa_grouped_gemm_thunk",
+        ":thunk",
+        "//xla:shape_util",
+        "//xla:statusor",
+        "//xla:types",
+        "//xla/service:buffer_assignment",
+        "//xla/tests:xla_internal_test_main",
+        "@com_google_googletest//:gtest",
+        "@local_tsl//tsl/lib/core:status_test_util",
+    ],
+)
+
+cc_library(
+    name = "musa_gemm_epilogue_thunk",
+    srcs = ["musa_gemm_epilogue_thunk.cc"],
+    hdrs = ["musa_gemm_epilogue_thunk.h"],
+    linkopts = [
+        "-L/usr/local/musa/lib",
+        "-L/usr/local/musa-4.3.5/lib",
+        "-lmublasLt",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":matmul_utils",
+        ":thunk",
+        "//xla:status",
+        "//xla:status_macros",
+        "//xla/service:buffer_assignment",
+        "//xla/stream_executor",
+        "//xla/stream_executor:device_memory",
+        "@com_google_absl//absl/strings",
+        "@local_config_musa//musa:musa",
+        "@local_config_musa//musa:musa_headers",
+        "@local_config_musa//musa:musa_rpath",
+        "@local_config_musa//musa:mublas",
         "@local_tsl//tsl/platform:logging",
     ],
 )
@@ -1536,7 +1860,10 @@ cc_library(
         "//xla/mlir_hlo:lhlo_gpu",
         "//xla/stream_executor",
         "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
         "@local_tsl//tsl/platform:status",
         "@local_tsl//tsl/platform:statusor",
@@ -2136,6 +2463,7 @@ cc_library(
         "//xla/stream_executor:device_description",
         "@com_google_absl//absl/strings",
         "@local_tsl//tsl/platform:errors",
+        "@local_tsl//tsl/platform:logging",
     ],
 )
 
@@ -2539,6 +2867,7 @@ cc_library(
         "@local_tsl//tsl/platform:casts",
         "@local_tsl//tsl/platform:env",
         "@local_tsl//tsl/platform:errors",
+        "@local_tsl//tsl/platform:logging",
         "@local_tsl//tsl/platform:statusor",
     ],
 )
@@ -2671,6 +3000,13 @@ cc_library(
         ":gemm_broadcast_folding_rewriter",
         ":gemm_rewriter",
         ":gemm_rewriter_triton",
+        ":musa_fusion_custom_calls",
+        ":musa_gemm_beta_chain_merger",
+        ":musa_dot_epilogue_fusion",
+        ":musa_gemm_epilogue_fusion",
+        ":musa_hot_tuple_softmax",
+        ":musa_reduction_chain",
+        ":musa_warp_row_reduction",
         ":gpu_async_collective_annotator",
         ":gpu_constants",
         ":gpu_conv_rewriter",
@@ -2711,6 +3047,7 @@ cc_library(
         ":tree_reduction_rewriter",
         ":variadic_op_splitter",
         "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/strings",
@@ -2725,6 +3062,7 @@ cc_library(
         "@llvm-project//mlir:Pass",
         "@llvm-project//mlir:Support",
         "//xla:autotune_results_proto_cc",
+        "//xla:shape_util",
         "//xla:status_macros",
         "//xla:statusor",
         "//xla:types",
@@ -2881,6 +3219,13 @@ cc_library(
         ":gemm_broadcast_folding_rewriter",
         ":gemm_rewriter",
         ":gemm_rewriter_triton",
+        ":musa_fusion_custom_calls",
+        ":musa_gemm_beta_chain_merger",
+        ":musa_dot_epilogue_fusion",
+        ":musa_gemm_epilogue_fusion",
+        ":musa_hot_tuple_softmax",
+        ":musa_reduction_chain",
+        ":musa_warp_row_reduction",
         ":gpu_async_collective_annotator",
         ":gpu_constants",
         ":gpu_conv_rewriter",
@@ -2920,6 +3265,7 @@ cc_library(
         ":topk_splitter",
         ":tree_reduction_rewriter",
         ":variadic_op_splitter",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/log:check",
@@ -2935,6 +3281,7 @@ cc_library(
         "@llvm-project//mlir:Pass",
         "@llvm-project//mlir:Support",
         "//xla:autotune_results_proto_cc",
+        "//xla:shape_util",
         "//xla:status_macros",
         "//xla:statusor",
         "//xla:types",
@@ -3359,6 +3706,7 @@ cc_library(
         ":target_constants",
         ":tree_reduction_rewriter",
         ":triangular_solve_rewriter",
+        "//xla:shape_util",
         "//xla:statusor",
         "//xla:util",
         "//xla:xla_proto_cc",
@@ -3379,6 +3727,10 @@ cc_library(
         "//xla/service/gpu/llvm_gpu_backend:mtgpu_backend",
         "//xla/service/llvm_ir:llvm_util",
         "//xla/stream_executor/musa:musa_platform_id",
+        "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
+        "@com_google_absl//absl/strings",
+        "@local_tsl//tsl/platform:logging",
         "@tf_runtime//:async_value",
         "@tf_runtime//:ref_count",
     ],
@@ -4310,11 +4662,14 @@ cc_library(
         "//xla:shape_util",
         "//xla:xla_data_proto_cc",
         "//xla/hlo/ir:hlo",
+        "//xla/hlo/ir:hlo_reachability",
         "//xla/service:hlo_creation_utils",
         "//xla/service:hlo_pass",
+        "@com_google_absl//absl/algorithm:container",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/types:span",
         "@local_tsl//tsl/platform:errors",
+        "@local_tsl//tsl/platform:logging",
     ],
 )
 

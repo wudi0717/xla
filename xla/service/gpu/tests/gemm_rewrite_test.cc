@@ -13,6 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <cstdlib>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -43,6 +44,45 @@ namespace gpu {
 namespace {
 
 namespace m = ::xla::match;
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    const char* old_value = std::getenv(name);
+    if (old_value != nullptr) {
+      old_value_ = old_value;
+    }
+    Set(value);
+  }
+
+  ~ScopedEnvVar() {
+    if (old_value_.empty()) {
+      Unset();
+    } else {
+      Set(old_value_.c_str());
+    }
+  }
+
+ private:
+  void Set(const char* value) {
+#ifdef _WIN32
+    _putenv_s(name_, value);
+#else
+    setenv(name_, value, /*overwrite=*/1);
+#endif
+  }
+
+  void Unset() {
+#ifdef _WIN32
+    _putenv_s(name_, "");
+#else
+    unsetenv(name_);
+#endif
+  }
+
+  const char* name_;
+  std::string old_value_;
+};
 
 class GemmRewriteTest : public GpuCodegenTest {
  public:
@@ -1694,6 +1734,36 @@ ENTRY test {
 ; CHECK-DAG:         }
 ; CHECK-DAG:         "epilogue":"DEFAULT"
 ; CHECK:           }
+)");
+}
+
+TEST_F(LegacyCublasGemmRewriteTest, AvoidGemmBetaChainLeavesAdd) {
+  ScopedEnvVar avoid_gemm_beta_chain("MUSA_XLA_AVOID_GEMM_BETA_CHAIN", "1");
+  const char* hlo_text = R"(
+HloModule test
+
+ENTRY test {
+  w = f32[2,3] parameter(0)
+  x = f32[3,4] parameter(1)
+  first_dot = f32[2,4] dot(w, x), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  y = f32[2,3] parameter(2)
+  z = f32[3,4] parameter(3)
+  second_dot = f32[2,4] dot(y, z), lhs_contracting_dims={1}, rhs_contracting_dims={0}
+  ROOT out = f32[2,4] add(second_dot, first_dot)
+}
+
+)";
+
+  MatchOptimizedHlo(hlo_text,
+                    R"(
+; CHECK-LABEL: ENTRY %test (w: f32[2,3], x: f32[3,4], y: f32[2,3], z: f32[3,4]) -> f32[2,4] {
+; CHECK-DAG:     [[P0:%[^ ]+]] = f32[2,3]{1,0} parameter(0)
+; CHECK-DAG:     [[P1:%[^ ]+]] = f32[3,4]{1,0} parameter(1)
+; CHECK-DAG:     [[P2:%[^ ]+]] = f32[2,3]{1,0} parameter(2)
+; CHECK-DAG:     [[P3:%[^ ]+]] = f32[3,4]{1,0} parameter(3)
+; CHECK-DAG:     [[FIRST_GEMM:%[^ ]+]] = f32[2,4]{1,0} custom-call([[P0]], [[P1]]),
+; CHECK-DAG:     [[SECOND_GEMM:%[^ ]+]] = f32[2,4]{1,0} custom-call([[P2]], [[P3]]),
+; CHECK:         ROOT {{%[^ ]+}} = f32[2,4]{1,0} add([[SECOND_GEMM]], [[FIRST_GEMM]])
 )");
 }
 

@@ -114,45 +114,58 @@ static absl::Status MemsetImpl(const ServiceExecutableRunOptions* run_options,
   se::Stream* stream = run_options->stream();
   se::DeviceMemoryBase dst_data = GetDeviceAddress(dst);
   const bool is_zero = IsZero(constant);
+  const bool trace_enabled = IsMusaDebugRuntimeTraceEnabled();
 
   // If the constant is zero we can use memzero directly.
   if (is_zero) {
-    LogMusaRuntimeCustomCallBegin(
-        "xla.gpu.memset",
-        absl::StrCat("stream=", DebugString(stream),
-                     " dst=", DebugString(dst), " bytes=", dst_data.size(),
-                     " zero=true"));
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallBegin(
+          "xla.gpu.memset",
+          absl::StrCat("stream=", DebugString(stream),
+                       " dst=", DebugString(dst), " bytes=", dst_data.size(),
+                       " zero=true"));
+    }
     stream->ThenMemZero(&dst_data, dst_data.size());
     absl::Status status = absl::OkStatus();
-    LogMusaRuntimeCustomCallEnd("xla.gpu.memset", status);
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd("xla.gpu.memset", status);
+    }
     return status;
   }
 
   // If the constant is not zero, use the given pattern to `memset`.
   auto pattern_or = ToBitPattern(constant);
   if (!pattern_or.ok()) {
-    LogMusaRuntimeCustomCallEnd("xla.gpu.memset", pattern_or.status());
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd("xla.gpu.memset", pattern_or.status());
+    }
     return pattern_or.status();
   }
   uint32_t pattern = *pattern_or;
 
-  LogMusaRuntimeCustomCallBegin(
-      "xla.gpu.memset",
-      absl::StrCat("stream=", DebugString(stream),
-                   " dst=", DebugString(dst), " bytes=", dst_data.size(),
-                   " zero=false pattern=", pattern));
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallBegin(
+        "xla.gpu.memset",
+        absl::StrCat("stream=", DebugString(stream),
+                     " dst=", DebugString(dst), " bytes=", dst_data.size(),
+                     " zero=false pattern=", pattern));
+  }
 
   if (dst_data.size() % 4 != 0) {
     absl::Status status =
         absl::InvalidArgumentError("Memref size is not divisible by 4");
-    LogMusaRuntimeCustomCallEnd("xla.gpu.memset", status);
+    if (trace_enabled) {
+      LogMusaRuntimeCustomCallEnd("xla.gpu.memset", status);
+    }
     return status;
   }
 
   stream->ThenMemset32(&dst_data, pattern, dst_data.size());
 
   absl::Status status = absl::OkStatus();
-  LogMusaRuntimeCustomCallEnd("xla.gpu.memset", status);
+  if (trace_enabled) {
+    LogMusaRuntimeCustomCallEnd("xla.gpu.memset", status);
+  }
   return status;
 }
 

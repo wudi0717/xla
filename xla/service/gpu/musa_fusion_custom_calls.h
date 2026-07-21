@@ -23,6 +23,14 @@ inline constexpr char kMusaLayerNormCustomCallTarget[] =
     "__musa$layernorm";
 inline constexpr char kMusaMatmulBiasReluCustomCallTarget[] =
     "__musa$matmul_bias_relu";
+inline constexpr char kMusaGemmBetaChainCustomCallTarget[] =
+    "__musa$gemm_beta_chain";
+inline constexpr char kMusaGemmEpilogueCustomCallTarget[] =
+    "__musa$gemm_epilogue";
+inline constexpr char kMusaPointerArrayGemmCustomCallTarget[] =
+    "__musa$pointer_array_gemm";
+inline constexpr char kMusaSmallKDotCustomCallTarget[] =
+    "__musa$small_k_dot";
 
 }  // namespace gpu
 }  // namespace xla

@@ -221,6 +221,17 @@ std::string ObtainDeviceFunctionName(TargetDeviceFunctionID func_id,
   // appending a double or float specific suffix to a root name. The suffix and
   // the root name are specific to the target.
   struct TargetDeviceFunction gpu_root_names = GetDeviceFunctionRoot(func_id);
+  if (IsMtgpuTriple(target_triple) &&
+      func_id == TargetDeviceFunctionID::kLog1p) {
+    if (output_type == F32) {
+      return "__mt_log1p_f32";
+    } else if (output_type == F64) {
+      return "__mt_log1p_f64";
+    } else {
+      LOG(FATAL) << "Unexpected type while getting device function name: "
+                  << primitive_util::LowercasePrimitiveTypeName(output_type);
+    }
+  }
   if (target_triple.isNVPTX() || IsMtgpuTriple(target_triple)) {
     if (output_type == F32) {
       return StrCat(gpu_root_names.nvptx_root, "f");

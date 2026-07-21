@@ -6,4 +6,8 @@ static const Rule rules[] = {
     {"llvm.nvvm.barrier.cta.sync.aligned.all", "llvm.musa.barrier0", 1},
     {"llvm.nvvm.shfl.sync.down.i32", "llvm.musa.shfl.down.sync.i32", 2},
     {"llvm.nvvm.shfl.sync.down.f32", "llvm.musa.shfl.down.sync.i32", 3},
+    {"llvm.nearbyint.f32", "__mt_roundeven_f32", 0},
+    {"llvm.nearbyint.f64", "__mt_roundeven_f64", 0},
+    {"__nv_powf", "__mt_pow_f32", 0, true},
+    {"__nv_pow", "__mt_pow_f64", 0, true},
 };

@@ -1470,6 +1470,13 @@ class Stream {
                     "without DNN support";
   }
 
+  // Custom stream implementations can synchronize and destroy their native
+  // stream before the base Stream destructor runs. Marking that work as
+  // handled prevents the base destructor from synchronizing a dead handle.
+  void MarkDestructorSynchronizationHandled() {
+    destructor_synchronization_handled_ = true;
+  }
+
   // Runs the set of callbacks that are intended to run after
   // BlockHostUntilDone.
   void RunAfterBlockHostUntilDoneCallbacks();
@@ -1492,6 +1499,8 @@ class Stream {
 
   // The last error (if any) of all method calls.
   tsl::Status status_ ABSL_GUARDED_BY(mu_);
+
+  bool destructor_synchronization_handled_ = false;
 
   std::string name_;
 

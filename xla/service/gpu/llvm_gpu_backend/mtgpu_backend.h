@@ -42,6 +42,11 @@ StatusOr<std::vector<uint8_t>> CompileToHsaco(
 StatusOr<std::vector<uint8_t>> CompileLlvmIrToHsacoForTest(
     const std::string& ir_text, const DebugOptions& debug_options);
 
+// Test-only helper for validating MTGPU intrinsic rewrites before invoking the
+// external MUSA LLVM toolchain.
+void ConvertNvvmToMusaIntrinsicsForTest(
+    llvm::Module* module, bool enable_direct_mt_pow = false);
+
 }  // namespace mtgpu
 }  // namespace gpu
 }  // namespace xla

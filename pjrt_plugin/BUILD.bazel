@@ -1,6 +1,18 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 TF215_WHEEL_ROOT = "/workspace/openxla/pjrt_plugin/tf2.15/lib/python3.10/site-packages/tensorflow"
+
+cc_library(
+    name = "reusable_host_buffer_arena_plan",
+    srcs = ["src/reusable_host_buffer_arena_plan.cc"],
+    hdrs = ["src/reusable_host_buffer_arena_plan.h"],
+)
+
+cc_test(
+    name = "reusable_host_buffer_arena_plan_test",
+    srcs = ["src/reusable_host_buffer_arena_plan_test.cc"],
+    deps = [":reusable_host_buffer_arena_plan"],
+)
 
 cc_library(
     name = "musa_pjrt_core",
@@ -11,6 +23,7 @@ cc_library(
         ".",
     ],
     deps = [
+        ":reusable_host_buffer_arena_plan",
         "//xla/pjrt/c:pjrt_c_api_hdrs",
         "//xla/pjrt/c:pjrt_c_api_helpers",
         "//xla/pjrt/c:pjrt_c_api_wrapper_impl",
@@ -30,15 +43,16 @@ cc_library(
         "//xla:xla_proto_cc_impl",
         "//xla/hlo/ir:hlo",
         "//xla/pjrt:pjrt_client",
+        "//xla/pjrt:pjrt_stream_executor_client",
         "//xla/pjrt/gpu:se_gpu_pjrt_client",
-        "//xla/service:buffer_assignment_proto_cc",
-        "//xla/service:buffer_assignment_proto_cc_impl",
         "//xla/service:hlo_proto_cc",
         "//xla/service:hlo_proto_cc_impl",
         "//xla/stream_executor/musa:musa_platform",
         "//xla/stream_executor:device_description_proto_cc",
         "//xla/stream_executor:device_description_proto_cc_impl",
+        "//xla/stream_executor:device_memory",
         "//xla/stream_executor:platform_manager",
+        "//xla/stream_executor:stream_executor",
         "//xla/stream_executor:stream_executor_pimpl",
         "//xla/service/gpu:backend_configs_cc",
         "//xla/service/gpu:backend_configs_cc_impl",
@@ -50,9 +64,6 @@ cc_library(
         "//xla/service/gpu:hlo_op_profile_proto_cc",
         "//xla/service/gpu:hlo_op_profile_proto_cc_impl",
         "//xla/service/gpu:mtgpu_compiler",
-        "//xla/service/memory_space_assignment",
-        "//xla/service/memory_space_assignment:memory_space_assignment_proto_cc",
-        "//xla/service/memory_space_assignment:memory_space_assignment_proto_cc_impl",
         "//xla/stream_executor/gpu:gpu_init_impl",
         "@local_tsl//tsl/protobuf:dnn_proto_cc",
         "@local_tsl//tsl/protobuf:dnn_proto_cc_impl",
@@ -107,10 +118,11 @@ cc_binary(
     name = "libmusa_pjrt_plugin.so",
     linkshared = True,
     linkopts = [
-        "-Wl,-Bsymbolic-functions",
+        "-Wl,--version-script,$(location :musa_pjrt_plugin_version_script.lds)",
     ],
     deps = [
         ":musa_pjrt_core",
+        ":musa_pjrt_plugin_version_script.lds",
     ],
 )
 
